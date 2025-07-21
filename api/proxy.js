@@ -1,86 +1,93 @@
-// 文件名：api/proxy.js
+// api/proxy.js
+const { URL } = require('url'); // Node.js 内置的 URL 模块
 
 module.exports = async (req, res) => {
-    // 确保req.url是一个完整的URL，以便URL对象能正确解析
-    // Vercel的req.url通常是路径和查询字符串，例如 '/api/proxy?url=...'
-    // 为了正确解析查询参数，我们提供一个虚拟的baseURL
-    const fullUrl = new URL(req.url, `http://${req.headers.host}`);
-    const targetUrl = fullUrl.searchParams.get('url');
-
-    if (!targetUrl) {
-        res.statusCode = 400;
-        res.setHeader('Content-Type', 'text/plain');
-        res.end('Error: Missing "url" query parameter.');
-        return;
-    }
-
     try {
-        const proxyOptions = {
-            method: req.method,
-            headers: {}
-        };
+        // 1. 解析传入请求的 URL，获取 'url' 查询参数
+        // req.url 在 Vercel Serverless Function 中通常是 '/api/proxy?url=...'
+        const requestUrl = new URL(req.url, `http://${req.headers.host}`);
+        const targetUrl = requestUrl.searchParams.get('url');
 
-        // 复制原始请求的Header
-        // req.headers 是一个普通的JavaScript对象
-        for (const key in req.headers) {
-            // 避免转发可能导致问题的Header
-            if (!['host', 'connection', 'x-forwarded-for', 'x-real-ip', 'x-vercel-forwarded-for', 'user-agent'].includes(key.toLowerCase())) {
-                proxyOptions.headers[key] = req.headers[key];
-            }
-        }
-        // 添加自定义User-Agent
-        proxyOptions.headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.75 Safari/537.36 Proxy/Vercel-Native';
-
-        // 处理请求体 (POST/PUT/PATCH)
-        // 对于fetch API，可以直接将原始请求流作为body传递
-        if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
-            // 检查是否有Content-Length或Transfer-Encoding头，表明有请求体
-            if (req.headers['content-length'] || req.headers['transfer-encoding']) {
-                proxyOptions.body = req; // 直接将原始请求流作为body传递给fetch
-            }
+        if (!targetUrl) {
+            res.statusCode = 400;
+            res.end('Bad Request: "url" parameter is missing.');
+            return;
         }
 
-        // 发起请求到目标URL，使用Vercel环境自带的全局fetch
-        const proxyResponse = await fetch(targetUrl, proxyOptions);
-
-        // 复制目标响应的Header
-        for (const [key, value] of proxyResponse.headers.entries()) {
-            if (!['transfer-encoding', 'content-encoding', 'connection'].includes(key.toLowerCase())) {
-                res.setHeader(key, value);
-            }
-        }
-
-        // 设置响应状态码
-        res.statusCode = proxyResponse.status;
-
-        // 发送响应体
-        // proxyResponse.body 是一个 ReadableStream，直接 pipe 到 res
-        if (proxyResponse.body) {
-            proxyResponse.body.pipe(res);
-            // 确保流结束时响应也结束
-            proxyResponse.body.on('end', () => res.end());
-            proxyResponse.body.on('error', (err) => {
-                console.error('Proxy response body pipe error:', err);
-                if (!res.headersSent) { // 确保头未发送时才设置
-                    res.statusCode = 500;
-                    res.setHeader('Content-Type', 'text/plain');
-                    res.end('Proxy response body stream error.');
-                }
-            });
+        // 2. 准备转发给目标订阅服务器的请求头部
+        // 确保转发 Cloudflare Workers 发送的 User-Agent 和 Accept-Encoding
+        const proxyHeaders = {};
+        if (req.headers['user-agent']) {
+            proxyHeaders['User-Agent'] = req.headers['user-agent'];
         } else {
-            res.end();
+            // 提供一个默认的 User-Agent，以防 Cloudflare Worker 没有发送
+            proxyHeaders['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.75 Safari/537.36';
+        }
+
+        if (req.headers['accept-encoding']) {
+            proxyHeaders['Accept-Encoding'] = req.headers['accept-encoding'];
+        } else {
+            // 提供一个默认的 Accept-Encoding
+            proxyHeaders['Accept-Encoding'] = 'gzip, deflate, br';
+        }
+
+        // 转发其他可能的有用头部，但要小心可能导致问题的头部
+        // 例如，不要转发 'host', 'connection' 等
+        for (const headerName in req.headers) {
+            if (!['host', 'connection', 'content-length'].includes(headerName.toLowerCase())) {
+                proxyHeaders[headerName] = req.headers[headerName];
+            }
+        }
+        
+        // Vercel 内部可能已经处理了 X-Forwarded-For，但为了确保，可以手动添加
+        if (req.headers['x-forwarded-for']) {
+            proxyHeaders['X-Forwarded-For'] = req.headers['x-forwarded-for'];
+        } else if (req.socket && req.socket.remoteAddress) {
+            proxyHeaders['X-Forwarded-For'] = req.socket.remoteAddress;
+        }
+
+
+        // 3. 向目标订阅服务器发起请求
+        const response = await fetch(targetUrl, {
+            method: req.method, // 保留原始请求方法
+            headers: proxyHeaders, // 使用准备好的头部
+            // 对于非 GET/HEAD 请求，转发请求体
+            body: (req.method !== 'GET' && req.method !== 'HEAD') ? req : undefined,
+            redirect: 'follow', // 遵循重定向
+        });
+
+        // 4. 将目标订阅服务器的响应头部完整地转发回 Cloudflare Workers
+        for (const [key, value] of response.headers.entries()) {
+            // 避免转发一些可能由 Vercel 或 Cloudflare Workers 自动处理的头部，
+            // 或者可能导致问题的头部（如 'transfer-encoding'）。
+            // 常见的需要转发的订阅信息头部：
+            // 'subscription-userinfo', 'content-disposition', 'expires', 'cache-control'
+            // 默认情况下，转发所有非受限制的头部是安全的。
+            try {
+                res.setHeader(key, value);
+            } catch (e) {
+                // 有些头部可能无法通过 setHeader 设置，例如 'content-encoding' 如果响应已经被解压缩
+                console.warn(`无法设置响应头部 '${key}': ${e.message}`);
+            }
+        }
+
+        // 5. 设置响应状态码
+        res.statusCode = response.status;
+
+        // 6. 将目标订阅服务器的响应体完整地转发回 Cloudflare Workers
+        // 使用 Node.js 的管道流进行高效转发
+        if (response.body) {
+            // Convert web stream to Node.js stream for piping
+            const { Readable } = require('stream');
+            const nodeReadable = Readable.fromWeb(response.body);
+            nodeReadable.pipe(res);
+        } else {
+            res.end(); // 没有响应体
         }
 
     } catch (error) {
-        console.error('Proxy Error:', error);
-        // 确保在错误发生时，如果响应头还没发送，可以设置错误状态码
-        if (!res.headersSent) {
-            res.statusCode = 500;
-            res.setHeader('Content-Type', 'text/plain');
-            res.end(`Proxy Error: ${error.message}`);
-        } else {
-            // 如果头已发送，尝试结束响应以避免挂起
-            res.end();
-        }
+        console.error('Vercel 代理错误:', error);
+        res.statusCode = 500;
+        res.end(`Vercel Proxy Error: ${error.message}`);
     }
 };
