@@ -1,17 +1,13 @@
-// 文件名：api/proxy.js (依然放在 api 目录下)
+// 文件名：api/proxy.js
 
-// 不再需要 require('express')
-// 不再需要 require('node-fetch')，因为Vercel环境支持全局的fetch
-
-// Vercel Serverless Function 的标准入口是导出一个异步函数，接收 request 和 response 对象
 module.exports = async (req, res) => {
-    // 解析请求方法和URL参数
-    const method = req.method;
-    const url = new URL(req.url);
-    const targetUrl = url.searchParams.get('url'); // 从查询参数 'url' 获取目标 URL
+    // 确保req.url是一个完整的URL，以便URL对象能正确解析
+    // Vercel的req.url通常是路径和查询字符串，例如 '/api/proxy?url=...'
+    // 为了正确解析查询参数，我们提供一个虚拟的baseURL
+    const fullUrl = new URL(req.url, `http://${req.headers.host}`);
+    const targetUrl = fullUrl.searchParams.get('url');
 
     if (!targetUrl) {
-        // 使用原生的 res.status 和 res.send
         res.statusCode = 400;
         res.setHeader('Content-Type', 'text/plain');
         res.end('Error: Missing "url" query parameter.');
@@ -20,44 +16,27 @@ module.exports = async (req, res) => {
 
     try {
         const proxyOptions = {
-            method: method,
+            method: req.method,
             headers: {}
         };
 
         // 复制原始请求的Header
-        // 注意：req.headers 是一个 Headers 对象，可以直接迭代
-        for (const [key, value] of Object.entries(req.headers)) {
+        // req.headers 是一个普通的JavaScript对象
+        for (const key in req.headers) {
             // 避免转发可能导致问题的Header
             if (!['host', 'connection', 'x-forwarded-for', 'x-real-ip', 'x-vercel-forwarded-for', 'user-agent'].includes(key.toLowerCase())) {
-                proxyOptions.headers[key] = value;
+                proxyOptions.headers[key] = req.headers[key];
             }
         }
         // 添加自定义User-Agent
         proxyOptions.headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.75 Safari/537.36 Proxy/Vercel-Native';
 
         // 处理请求体 (POST/PUT/PATCH)
-        if (method === 'POST' || method === 'PUT' || method === 'PATCH') {
-            // Vercel的req对象通常会自动解析JSON或文本体
-            // 这里我们假设如果内容类型是JSON，则尝试解析
-            if (req.headers['content-type'] && req.headers['content-type'].includes('application/json')) {
-                // req.body 在Vercel原生函数中可能需要通过流读取
-                // 最简单的方法是等待Vercel自动处理，或者手动读取流
-                // 对于简单的POST，req.body可能已解析，但更稳健是读流
-                // 注意：在Vercel的Node.js运行时中，req对象可以直接读取body流
-                let body = '';
-                await new Promise((resolve, reject) => {
-                    req.on('data', chunk => {
-                        body += chunk.toString();
-                    });
-                    req.on('end', () => {
-                        proxyOptions.body = body;
-                        resolve();
-                    });
-                    req.on('error', reject);
-                });
-            } else {
-                 // 对于非JSON的POST请求，如果需要转发原始体，逻辑会更复杂
-                 // 这里简化处理，只转发JSON
+        // 对于fetch API，可以直接将原始请求流作为body传递
+        if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
+            // 检查是否有Content-Length或Transfer-Encoding头，表明有请求体
+            if (req.headers['content-length'] || req.headers['transfer-encoding']) {
+                proxyOptions.body = req; // 直接将原始请求流作为body传递给fetch
             }
         }
 
@@ -77,16 +56,31 @@ module.exports = async (req, res) => {
         // 发送响应体
         // proxyResponse.body 是一个 ReadableStream，直接 pipe 到 res
         if (proxyResponse.body) {
-            proxyResponse.body.pipe(res); // 将响应流直接导向 Vercel 的响应流
+            proxyResponse.body.pipe(res);
+            // 确保流结束时响应也结束
+            proxyResponse.body.on('end', () => res.end());
+            proxyResponse.body.on('error', (err) => {
+                console.error('Proxy response body pipe error:', err);
+                if (!res.headersSent) { // 确保头未发送时才设置
+                    res.statusCode = 500;
+                    res.setHeader('Content-Type', 'text/plain');
+                    res.end('Proxy response body stream error.');
+                }
+            });
         } else {
-            res.end(); // 没有响应体则直接结束
+            res.end();
         }
 
     } catch (error) {
         console.error('Proxy Error:', error);
-        res.statusCode = 500;
-        res.setHeader('Content-Type', 'text/plain');
-        res.end(`Proxy Error: ${error.message}`);
+        // 确保在错误发生时，如果响应头还没发送，可以设置错误状态码
+        if (!res.headersSent) {
+            res.statusCode = 500;
+            res.setHeader('Content-Type', 'text/plain');
+            res.end(`Proxy Error: ${error.message}`);
+        } else {
+            // 如果头已发送，尝试结束响应以避免挂起
+            res.end();
+        }
     }
 };
-
