@@ -7,7 +7,7 @@
     "start": "node api/proxy.js"
   },
   "dependencies": {
-    "express": "4.19.2",
-    "node-fetch": "2.6.0"
+    "express": "^4.19.2",
+    "node-fetch": "^2.6.0"
   }
 }
