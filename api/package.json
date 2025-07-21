@@ -1,0 +1,13 @@
+{
+  "name": "my-proxy-app",
+  "version": "1.0.0",
+  "description": "A simple proxy serverless function for Vercel.",
+  "main": "api/proxy.js", // 指向你的代理文件路径
+  "dependencies": {
+    "express": "^4.19.2",
+    "node-fetch": "^2.7.0" // 如果你的代码中使用node-fetch，则需要此项
+  },
+  "scripts": {
+    "start": "node api/proxy.js" // 可选，用于本地开发
+  }
+}
