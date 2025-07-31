@@ -16,7 +16,7 @@ module.exports = async (req, res) => {
 
         console.log(`[Vercel Proxy] 收到请求，目标URL: ${targetUrl}`);
 
-        // 2. 精简请求头部，仅保留必要的头
+        // 2. 精简请求头部
         const proxyHeaders = {
             'User-Agent': req.headers['user-agent'] || 'clash-verge/v1.5.1, NekoBox/Android/1.3.0(Prefer ClashMeta Format)',
             'Accept-Encoding': req.headers['accept-encoding'] || 'gzip',
@@ -31,7 +31,7 @@ module.exports = async (req, res) => {
             headers: proxyHeaders,
             body: (req.method !== 'GET' && req.method !== 'HEAD') ? req : undefined,
             redirect: 'follow',
-            signal: AbortSignal.timeout(10000) // 设置 10 秒超时
+            signal: AbortSignal.timeout(10000)
         });
 
         // 4. 记录目标服务器响应
@@ -41,7 +41,10 @@ module.exports = async (req, res) => {
             console.log(`  ${key}: ${value}`);
         }
 
-        // 5. 转发响应头部
+        // 5. 设置响应状态码（直接使用目标服务器的状态码）
+        res.statusCode = response.status;
+
+        // 6. 转发响应头部
         for (const [key, value] of response.headers.entries()) {
             const lowerCaseKey = key.toLowerCase();
             if (!['transfer-encoding', 'connection', 'keep-alive', 'content-encoding', 'content-length'].includes(lowerCaseKey)) {
@@ -53,9 +56,6 @@ module.exports = async (req, res) => {
                 }
             }
         }
-
-        // 6. 设置响应状态码
-        res.statusCode = response.status;
 
         // 7. 转发响应体
         if (response.body) {
@@ -78,22 +78,31 @@ module.exports = async (req, res) => {
             } : null
         });
 
-        // 捕获目标服务器的错误详情
+        // 尝试从错误中获取目标服务器的状态码和响应体
+        let statusCode = 500;
+        let errorMessage = `Vercel Proxy Error: ${error.message}`;
+        let errorBody = null;
+
         if (error.cause && error.cause.response) {
-            console.log('[Vercel Proxy] 目标服务器错误详情:');
-            console.log(`状态码: ${error.cause.response.status}`);
+            statusCode = error.cause.response.status;
+            console.log(`[Vercel Proxy] 目标服务器错误详情: 状态码 ${statusCode}`);
             for (const [key, value] of error.cause.response.headers.entries()) {
                 console.log(`  ${key}: ${value}`);
             }
             try {
-                const errorBody = await error.cause.response.text();
-                console.log(`错误响应体: ${errorBody.substring(0, 200)}...`);
+                errorBody = await error.cause.response.text();
+                console.log(`[Vercel Proxy] 错误响应体: ${errorBody.substring(0, 200)}...`);
             } catch (bodyError) {
                 console.error('[Vercel Proxy] 无法读取错误响应体:', bodyError);
             }
+        } else if (error.message.includes('ECONNRESET')) {
+            // 推测为目标服务器限制（如 403）
+            statusCode = 403;
+            errorMessage = '访问被拒绝，可能IP被限制或订阅已失效';
+            console.log('[Vercel Proxy] 推测目标服务器返回 403 (ECONNRESET)');
         }
 
-        res.statusCode = 500;
-        res.end(`Vercel Proxy Error: ${error.message}`);
+        res.statusCode = statusCode;
+        res.end(errorBody || errorMessage);
     }
 };
