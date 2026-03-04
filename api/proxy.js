@@ -11,6 +11,81 @@ const SUPPORTED_PROTOCOLS = [
     'warp', 'naive', 'httpobfs', 'websocket', 'quic', 'grpc', 'http2', 'http3'
 ];
 
+// UA 轮换列表（机场友好优先）
+const USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Mihomo/1.18.0',
+    'Clash Verge/v1.7.8',
+    'FlClash/v0.8.76 clash-verge Platform/android',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36 Clash-Meta/1.18.0',
+];
+
+// 带 UA 轮换 + 重试的上游请求
+async function fetchWithUARotation(targetUrl, req, maxRetriesPerUA = 2) {
+    let lastError = null;
+
+    for (let uaIndex = 0; uaIndex < USER_AGENTS.length; uaIndex++) {
+        const ua = USER_AGENTS[uaIndex];
+
+        for (let attempt = 1; attempt <= maxRetriesPerUA; attempt++) {
+            try {
+                const proxyHeaders = {
+                    'User-Agent': ua,
+                    'Accept-Encoding': 'gzip',
+                    'X-Forwarded-For': req.headers['x-forwarded-for'] || req.socket?.remoteAddress
+                };
+
+                console.log(`[Vercel Proxy] 尝试 UA(${uaIndex + 1}/${USER_AGENTS.length}) 第 ${attempt} 次: ${ua}`);
+                console.log(`[Vercel Proxy] 最终转发请求头到目标URL: ${JSON.stringify(proxyHeaders, null, 2)}`);
+
+                const response = await fetch(targetUrl, {
+                    method: req.method,
+                    headers: proxyHeaders,
+                    body: (req.method !== 'GET' && req.method !== 'HEAD') ? req : undefined,
+                    redirect: 'follow',
+                    signal: AbortSignal.timeout(10000)
+                });
+
+                // 对于常见风控状态码，直接换下一个 UA 更有效
+                if ([403, 429, 503].includes(response.status)) {
+                    console.warn(`[Vercel Proxy] 状态码 ${response.status}，切换下一个 UA`);
+                    lastError = new Error(`HTTP ${response.status} (UA blocked: ${ua})`);
+                    break;
+                }
+
+                // 其他非2xx情况，在同UA内可重试
+                if (!response.ok) {
+                    if (attempt < maxRetriesPerUA) {
+                        const waitMs = 700 * attempt;
+                        console.warn(`[Vercel Proxy] HTTP ${response.status}，${waitMs}ms 后重试同UA`);
+                        await new Promise(r => setTimeout(r, waitMs));
+                        continue;
+                    }
+                    lastError = new Error(`HTTP ${response.status}`);
+                    break;
+                }
+
+                return { response, usedUA: ua, uaIndex };
+            } catch (error) {
+                lastError = error;
+                console.warn(`[Vercel Proxy] UA请求异常: ${error.message}`);
+
+                if (attempt < maxRetriesPerUA) {
+                    const waitMs = 1000 * attempt;
+                    await new Promise(r => setTimeout(r, waitMs));
+                    continue;
+                }
+
+                if (uaIndex < USER_AGENTS.length - 1) {
+                    await new Promise(r => setTimeout(r, 500));
+                }
+            }
+        }
+    }
+
+    throw lastError || new Error('All User-Agents failed');
+}
+
 module.exports = async (req, res) => {
     try {
         // 1. 解析传入请求的 URL
@@ -27,41 +102,26 @@ module.exports = async (req, res) => {
 
         console.log(`[Vercel Proxy] 收到请求，目标URL: ${targetUrl}`);
 
-        // 2. 精简请求头部
-        const proxyHeaders = {
-            'User-Agent': req.headers['user-agent'] || 'clash-verge/v1.5.1, NekoBox/Android/1.3.0(Prefer ClashMeta Format)',
-            'Accept-Encoding': 'gzip',
-            'X-Forwarded-For': req.headers['x-forwarded-for'] || req.socket?.remoteAddress
-        };
+        // 2. 通过 UA 轮换向目标服务器发起请求
+        const { response, usedUA } = await fetchWithUARotation(targetUrl, req, 2);
+        console.log(`[Vercel Proxy] 请求成功，使用UA: ${usedUA}`);
 
-        console.log(`[Vercel Proxy] 最终转发请求头到目标URL: ${JSON.stringify(proxyHeaders, null, 2)}`);
-
-        // 3. 向目标服务器发起请求
-        const response = await fetch(targetUrl, {
-            method: req.method,
-            headers: proxyHeaders,
-            body: (req.method !== 'GET' && req.method !== 'HEAD') ? req : undefined,
-            redirect: 'follow',
-            signal: AbortSignal.timeout(10000)
-        });
-
-        // 4. 记录目标服务器响应
+        // 3. 记录目标服务器响应
         console.log(`[Vercel Proxy] 收到响应，状态码: ${response.status}`);
         console.log('响应头:');
         for (const [key, value] of response.headers.entries()) {
             console.log(`  ${key}: ${value}`);
         }
 
-        // 5. 获取响应内容类型和编码
+        // 4. 获取响应内容类型和编码
         const contentType = response.headers.get('content-type') || 'text/plain';
         const contentEncoding = response.headers.get('content-encoding') || '';
 
-        // 6. 读取响应体并处理 GZIP 解压缩
+        // 5. 读取响应体并处理 GZIP 解压缩（用于协议统计，不影响原始转发）
         const buffer = await response.arrayBuffer();
         let contentString;
         const decoder = new TextDecoder('utf-8', { fatal: false });
 
-        // 统一处理输入内容
         if (contentEncoding.includes('gzip')) {
             try {
                 contentString = ungzip(new Uint8Array(buffer), { to: 'string' });
@@ -74,13 +134,12 @@ module.exports = async (req, res) => {
             contentString = decoder.decode(buffer);
         }
 
-        // 7. 解析节点协议（复制自 clashConverter.js 的 parseNodeProtocols 逻辑，queryMode=true）
+        // 6. 解析节点协议
         let nodeProtocols = { total: 0, protocols: {} };
         try {
             let textToParse = contentString;
             let isClashYaml = false;
 
-            // 检查是否为 Base64 编码，并解码
             try {
                 const decoded = Buffer.from(textToParse, 'base64').toString('utf8');
                 if (decoded.includes('://') || decoded.includes('proxies:')) {
@@ -88,11 +147,9 @@ module.exports = async (req, res) => {
                     console.log('[Vercel Proxy] Base64 解码成功');
                 }
             } catch (e) {
-                // 解码失败，忽略
                 console.log('[Vercel Proxy] Base64 解码失败，忽略:', e.message);
             }
 
-            // 检查是否为 Clash YAML
             try {
                 if (textToParse.includes('proxies:') && textToParse.includes('proxy-groups:')) {
                     const config = load(textToParse);
@@ -104,7 +161,6 @@ module.exports = async (req, res) => {
                 console.warn('[Vercel Proxy] YAML 解析失败，按普通节点列表处理:', error.message);
             }
 
-            // 解析协议
             if (isClashYaml) {
                 const config = load(textToParse);
                 config.proxies.forEach(proxy => {
@@ -132,10 +188,10 @@ module.exports = async (req, res) => {
             nodeProtocols = { total: 0, protocols: {} };
         }
 
-        // 8. 设置响应状态码
+        // 7. 设置响应状态码
         res.statusCode = response.status;
 
-        // 9. 转发响应头部并添加节点协议信息
+        // 8. 转发响应头部并添加节点协议信息
         for (const [key, value] of response.headers.entries()) {
             const lowerCaseKey = key.toLowerCase();
             if (!['transfer-encoding', 'connection', 'keep-alive'].includes(lowerCaseKey)) {
@@ -148,15 +204,16 @@ module.exports = async (req, res) => {
             }
         }
 
-        // 添加节点协议信息到响应头
         try {
             res.setHeader('X-Node-Protocols', JSON.stringify(nodeProtocols));
+            res.setHeader('X-Used-User-Agent', usedUA);
             console.log(`[Vercel Proxy] 添加节点协议头: X-Node-Protocols: ${JSON.stringify(nodeProtocols)}`);
+            console.log(`[Vercel Proxy] 添加UA头: X-Used-User-Agent: ${usedUA}`);
         } catch (e) {
-            console.warn(`[Vercel Proxy] 无法设置 X-Node-Protocols 头: ${e.message}`);
+            console.warn(`[Vercel Proxy] 无法设置自定义响应头: ${e.message}`);
         }
 
-        // 10. 转发响应体
+        // 9. 转发响应体（保持原始内容，不改编码）
         if (buffer.byteLength > 0) {
             const nodeReadable = Readable.from(Buffer.from(buffer));
             nodeReadable.pipe(res);
@@ -177,7 +234,6 @@ module.exports = async (req, res) => {
             } : null
         });
 
-        // 尝试从错误中获取目标服务器的状态码和响应体
         let statusCode = 500;
         let errorMessage = `Vercel Proxy Error: ${error.message}`;
         let errorBody = null;
