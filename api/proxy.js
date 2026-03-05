@@ -10,12 +10,24 @@ const SUPPORTED_PROTOCOLS = [
   'warp', 'naive', 'httpobfs', 'websocket', 'quic', 'grpc', 'http2', 'http3'
 ];
 
-// 修改后的 UA 列表（3 个：2 个代理 + 1 个浏览器保底）
+// UA 列表
 const USER_AGENTS = [
-    'Shadowrocket/1872 CFNetwork/1408.0.4 Darwin/22.5.0',  // iOS 代理（隐蔽）
-    'ClashforWindows/0.20.39',                               // Windows 代理
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',  // 浏览器保底
+  'Shadowrocket/1872 CFNetwork/1408.0.4 Darwin/22.5.0',
+  'ClashforWindows/0.20.39',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
 ];
+
+const EXPOSE_HEADERS = [
+  'subscription-userinfo',
+  'Subscription-Userinfo',
+  'x-subscription-userinfo',
+  'profile-update-interval',
+  'Profile-Update-Interval',
+  'x-profile-update-interval',
+  'X-Node-Protocols',
+  'X-Used-User-Agent',
+  'X-Proxy-Has-SubInfo'
+].join(', ');
 
 function getClientIp(req) {
   const xff = req.headers['x-forwarded-for'];
@@ -36,7 +48,10 @@ async function fetchWithUARotation(targetUrl, req, maxRetriesPerUA = 2) {
       try {
         const proxyHeaders = {
           'User-Agent': ua,
+          'Accept': '*/*',
           'Accept-Encoding': 'gzip',
+          'Cache-Control': 'no-cache',
+          'Pragma': 'no-cache',
           'X-Forwarded-For': clientIp
         };
 
@@ -47,22 +62,23 @@ async function fetchWithUARotation(targetUrl, req, maxRetriesPerUA = 2) {
           method: req.method,
           headers: proxyHeaders,
           body: (req.method !== 'GET' && req.method !== 'HEAD') ? req : undefined,
-          redirect: 'follow',  // 保持原样
+          redirect: 'follow',
           signal: AbortSignal.timeout(10000)
         });
 
-        // 检查是否被 UA 拦截（403/429/503）
+        // UA 可能被拦截
         if ([403, 429, 503].includes(response.status)) {
           console.warn(`[Vercel Proxy] 状态码 ${response.status}，切换下一个 UA`);
           lastError = new Error(`HTTP ${response.status} (UA blocked: ${ua})`);
           break;
         }
 
-        // 检查是否有流量头（即使 200 也要验证）
+        // 检查是否有流量头
         const hasSubInfo = !!(
           response.headers.get('subscription-userinfo') ||
           response.headers.get('Subscription-Userinfo') ||
-          response.headers.get('x-subscription-userinfo')
+          response.headers.get('x-subscription-userinfo') ||
+          response.headers.get('X-Subscription-Userinfo')
         );
 
         if (response.ok && hasSubInfo) {
@@ -70,14 +86,13 @@ async function fetchWithUARotation(targetUrl, req, maxRetriesPerUA = 2) {
           return { response, usedUA: ua, uaIndex };
         }
 
-        // 200 但无流量头 → 换 UA（仅对前 2 个代理 UA 生效）
+        // 200 但无流量头：前两个 UA 继续换
         if (response.ok && !hasSubInfo && uaIndex < USER_AGENTS.length - 1) {
           console.warn('[Vercel Proxy] 200 但无流量头，尝试下一个 UA');
           lastError = new Error('No subscription headers');
           break;
         }
 
-        // 非 200 且非拦截状态码 → 重试或换 UA
         if (!response.ok) {
           if (attempt < maxRetriesPerUA) {
             const waitMs = 700 * attempt;
@@ -89,7 +104,7 @@ async function fetchWithUARotation(targetUrl, req, maxRetriesPerUA = 2) {
           break;
         }
 
-        // 最后一个 UA（浏览器）且无流量头 → 直接返回
+        // 最后一个 UA（浏览器）即使无流量头也返回
         return { response, usedUA: ua, uaIndex };
 
       } catch (error) {
@@ -114,12 +129,25 @@ async function fetchWithUARotation(targetUrl, req, maxRetriesPerUA = 2) {
 
 module.exports = async (req, res) => {
   try {
+    // CORS 预检
+    if (req.method === 'OPTIONS') {
+      res.statusCode = 204;
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, subscription-userinfo, profile-update-interval');
+      res.setHeader('Access-Control-Expose-Headers', EXPOSE_HEADERS);
+      res.end();
+      return;
+    }
+
     const requestUrl = new URL(req.url, `http://${req.headers.host}`);
     const targetUrl = requestUrl.searchParams.get('url');
 
     if (!targetUrl) {
       res.statusCode = 400;
       res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Expose-Headers', EXPOSE_HEADERS);
       res.end('Bad Request: "url" parameter is missing.');
       console.error('[Vercel Proxy] Bad Request: "url" parameter is missing.');
       return;
@@ -138,6 +166,7 @@ module.exports = async (req, res) => {
     const contentEncoding = response.headers.get('content-encoding') || '';
     const buffer = await response.arrayBuffer();
 
+    // 仅用于解析节点类型，不改实际回传 body
     let contentString;
     const decoder = new TextDecoder('utf-8', { fatal: false });
 
@@ -209,10 +238,14 @@ module.exports = async (req, res) => {
 
     res.statusCode = response.status;
 
-    // 关键：保持旧版“原样透传响应头”逻辑
+    // CORS 响应头（让前端可读自定义头）
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Expose-Headers', EXPOSE_HEADERS);
+
+    // 原样透传响应头（过滤 hop-by-hop & content-length）
     for (const [key, value] of response.headers.entries()) {
       const lowerCaseKey = key.toLowerCase();
-      if (!['transfer-encoding', 'connection', 'keep-alive'].includes(lowerCaseKey)) {
+      if (!['transfer-encoding', 'connection', 'keep-alive', 'content-length'].includes(lowerCaseKey)) {
         try {
           res.setHeader(key, value);
           console.log(`[Vercel Proxy] 转发响应头: ${key}: ${value}`);
@@ -222,7 +255,7 @@ module.exports = async (req, res) => {
       }
     }
 
-    // 额外补写关键头（不影响原样透传）
+    // 关键头补写：subscription-userinfo
     const subInfo =
       response.headers.get('subscription-userinfo') ||
       response.headers.get('Subscription-Userinfo') ||
@@ -240,6 +273,7 @@ module.exports = async (req, res) => {
       }
     }
 
+    // 关键头补写：profile-update-interval
     const pui =
       response.headers.get('profile-update-interval') ||
       response.headers.get('Profile-Update-Interval') ||
@@ -251,6 +285,7 @@ module.exports = async (req, res) => {
       try {
         res.setHeader('profile-update-interval', pui);
         res.setHeader('Profile-Update-Interval', pui);
+        res.setHeader('x-profile-update-interval', pui);
       } catch (e) {
         console.warn('[Vercel Proxy] 无法补写 profile-update-interval:', e.message);
       }
@@ -260,7 +295,7 @@ module.exports = async (req, res) => {
       res.setHeader('X-Node-Protocols', JSON.stringify(nodeProtocols));
       res.setHeader('X-Used-User-Agent', usedUA);
       res.setHeader('X-Proxy-Has-SubInfo', subInfo ? '1' : '0');
-      console.log(`[Vercel Proxy] 添加 X-Node-Protocols / X-Used-User-Agent`);
+      console.log(`[Vercel Proxy] 添加 X-Node-Protocols / X-Used-User-Agent / X-Proxy-Has-SubInfo`);
     } catch (e) {
       console.warn(`[Vercel Proxy] 无法设置自定义响应头: ${e.message}`);
     }
@@ -309,6 +344,8 @@ module.exports = async (req, res) => {
 
     res.statusCode = statusCode;
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Expose-Headers', EXPOSE_HEADERS);
     res.end(errorBody || errorMessage);
   }
 };
