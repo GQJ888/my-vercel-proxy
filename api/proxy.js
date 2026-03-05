@@ -10,12 +10,11 @@ const SUPPORTED_PROTOCOLS = [
   'warp', 'naive', 'httpobfs', 'websocket', 'quic', 'grpc', 'http2', 'http3'
 ];
 
+// 修改后的 UA 列表（3 个：2 个代理 + 1 个浏览器保底）
 const USER_AGENTS = [
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Mihomo/1.18.0',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
-  'Clash Verge/v1.7.8',
-  'FlClash/v0.8.76 clash-verge Platform/android',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36 Clash-Meta/1.18.0',
+    'Shadowrocket/1872 CFNetwork/1408.0.4 Darwin/22.5.0',  // iOS 代理（隐蔽）
+    'ClashforWindows/0.20.39',                               // Windows 代理
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',  // 浏览器保底
 ];
 
 function getClientIp(req) {
@@ -48,16 +47,37 @@ async function fetchWithUARotation(targetUrl, req, maxRetriesPerUA = 2) {
           method: req.method,
           headers: proxyHeaders,
           body: (req.method !== 'GET' && req.method !== 'HEAD') ? req : undefined,
-          redirect: 'follow',
+          redirect: 'follow',  // 保持原样
           signal: AbortSignal.timeout(10000)
         });
 
+        // 检查是否被 UA 拦截（403/429/503）
         if ([403, 429, 503].includes(response.status)) {
           console.warn(`[Vercel Proxy] 状态码 ${response.status}，切换下一个 UA`);
           lastError = new Error(`HTTP ${response.status} (UA blocked: ${ua})`);
           break;
         }
 
+        // 检查是否有流量头（即使 200 也要验证）
+        const hasSubInfo = !!(
+          response.headers.get('subscription-userinfo') ||
+          response.headers.get('Subscription-Userinfo') ||
+          response.headers.get('x-subscription-userinfo')
+        );
+
+        if (response.ok && hasSubInfo) {
+          console.log('[Vercel Proxy] 获取到流量头，返回响应');
+          return { response, usedUA: ua, uaIndex };
+        }
+
+        // 200 但无流量头 → 换 UA（仅对前 2 个代理 UA 生效）
+        if (response.ok && !hasSubInfo && uaIndex < USER_AGENTS.length - 1) {
+          console.warn('[Vercel Proxy] 200 但无流量头，尝试下一个 UA');
+          lastError = new Error('No subscription headers');
+          break;
+        }
+
+        // 非 200 且非拦截状态码 → 重试或换 UA
         if (!response.ok) {
           if (attempt < maxRetriesPerUA) {
             const waitMs = 700 * attempt;
@@ -69,7 +89,9 @@ async function fetchWithUARotation(targetUrl, req, maxRetriesPerUA = 2) {
           break;
         }
 
+        // 最后一个 UA（浏览器）且无流量头 → 直接返回
         return { response, usedUA: ua, uaIndex };
+
       } catch (error) {
         lastError = error;
         console.warn(`[Vercel Proxy] UA请求异常: ${error.message}`);
