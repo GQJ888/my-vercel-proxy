@@ -52,9 +52,6 @@ async function fetchWithUARotation(targetUrl, req, maxRetriesPerUA = 2) {
           'X-Forwarded-For': clientIp
         };
 
-        console.log(`[Vercel Proxy] 尝试 UA(${uaIndex + 1}/${USER_AGENTS.length}) 第 ${attempt} 次: ${ua}`);
-        console.log(`[Vercel Proxy] 转发请求头: ${JSON.stringify(proxyHeaders, null, 2)}`);
-
         const response = await fetch(targetUrl, {
           method: req.method,
           headers: proxyHeaders,
@@ -65,15 +62,12 @@ async function fetchWithUARotation(targetUrl, req, maxRetriesPerUA = 2) {
 
         if ([403, 429, 503].includes(response.status)) {
           lastError = new Error(`HTTP ${response.status} (UA blocked: ${ua})`);
-          console.warn(`[Vercel Proxy] 状态码 ${response.status}，切换下一个 UA`);
           break;
         }
 
         if (!response.ok) {
           if (attempt < maxRetriesPerUA) {
-            const waitMs = 700 * attempt;
-            console.warn(`[Vercel Proxy] HTTP ${response.status}，${waitMs}ms 后重试同UA`);
-            await new Promise(r => setTimeout(r, waitMs));
+            await new Promise(r => setTimeout(r, 700 * attempt));
             continue;
           }
           lastError = new Error(`HTTP ${response.status}`);
@@ -83,14 +77,10 @@ async function fetchWithUARotation(targetUrl, req, maxRetriesPerUA = 2) {
         return { response, usedUA: ua, uaIndex };
       } catch (error) {
         lastError = error;
-        console.warn(`[Vercel Proxy] UA请求异常: ${error.message}`);
-
         if (attempt < maxRetriesPerUA) {
-          const waitMs = 1000 * attempt;
-          await new Promise(r => setTimeout(r, waitMs));
+          await new Promise(r => setTimeout(r, 1000 * attempt));
           continue;
         }
-
         if (uaIndex < USER_AGENTS.length - 1) {
           await new Promise(r => setTimeout(r, 500));
         }
@@ -110,29 +100,16 @@ module.exports = async (req, res) => {
       res.statusCode = 400;
       res.setHeader('Content-Type', 'text/plain; charset=utf-8');
       res.end('Bad Request: "url" parameter is missing.');
-      console.error('[Vercel Proxy] Bad Request: "url" parameter is missing.');
       return;
     }
 
-    console.log(`[Vercel Proxy] 收到请求，目标URL: ${targetUrl}`);
-
     const { response, usedUA } = await fetchWithUARotation(targetUrl, req, 2);
-    console.log(`[Vercel Proxy] 请求成功，使用UA: ${usedUA}`);
-    console.log(`[Vercel Proxy] 状态码: ${response.status}`);
-
-    for (const [key, value] of response.headers.entries()) {
-      console.log(`  ${key}: ${value}`);
-    }
-
-    const contentType = response.headers.get('content-type') || 'text/plain';
     const buffer = await response.arrayBuffer();
 
-    // 不依赖 content-encoding 头，直接尝试 ungzip，失败则按文本解码
     let contentString = '';
     const decoder = new TextDecoder('utf-8', { fatal: false });
     try {
       contentString = ungzip(new Uint8Array(buffer), { to: 'string' });
-      console.log('[Vercel Proxy] ungzip 成功');
     } catch {
       contentString = decoder.decode(buffer);
     }
@@ -144,24 +121,15 @@ module.exports = async (req, res) => {
 
       try {
         const decoded = Buffer.from(textToParse, 'base64').toString('utf8');
-        if (decoded.includes('://') || decoded.includes('proxies:')) {
-          textToParse = decoded;
-          console.log('[Vercel Proxy] Base64 解码成功');
-        }
-      } catch (e) {
-        console.log('[Vercel Proxy] Base64 解码失败，忽略:', e.message);
-      }
+        if (decoded.includes('://') || decoded.includes('proxies:')) textToParse = decoded;
+      } catch {}
 
       try {
         if (textToParse.includes('proxies:') && textToParse.includes('proxy-groups:')) {
           const config = load(textToParse);
-          if (config && Array.isArray(config.proxies)) {
-            isClashYaml = true;
-          }
+          if (config && Array.isArray(config.proxies)) isClashYaml = true;
         }
-      } catch (error) {
-        console.warn('[Vercel Proxy] YAML 解析失败，按普通节点列表处理:', error.message);
-      }
+      } catch {}
 
       if (isClashYaml) {
         const config = load(textToParse);
@@ -184,28 +152,19 @@ module.exports = async (req, res) => {
           }
         }
       }
-
-      console.log(`[Vercel Proxy] 节点协议解析结果: ${JSON.stringify(nodeProtocols)}`);
-    } catch (error) {
-      console.error(`[Vercel Proxy] 节点协议解析失败: ${error.message}`);
+    } catch {
       nodeProtocols = { total: 0, protocols: {} };
     }
 
     res.statusCode = response.status;
 
-    // 转发上游响应头
     for (const [key, value] of response.headers.entries()) {
       const lower = key.toLowerCase();
       if (!['transfer-encoding', 'connection', 'keep-alive'].includes(lower)) {
-        try {
-          res.setHeader(key, value);
-        } catch (e) {
-          console.warn(`[Vercel Proxy] 无法设置响应头 '${key}': ${e.message}`);
-        }
+        try { res.setHeader(key, value); } catch {}
       }
     }
 
-    // 强制透传 subscription-userinfo（多大小写兼容）
     const subInfo = getHeaderAny(response.headers, [
       'subscription-userinfo',
       'Subscription-Userinfo',
@@ -218,56 +177,31 @@ module.exports = async (req, res) => {
         res.setHeader('subscription-userinfo', subInfo);
         res.setHeader('Subscription-Userinfo', subInfo);
         res.setHeader('x-subscription-userinfo', subInfo);
-        console.log('[Vercel Proxy] 强制透传 subscription-userinfo');
-      } catch (e) {
-        console.warn('[Vercel Proxy] 设置 subscription-userinfo 失败:', e.message);
-      }
+      } catch {}
     }
 
     try {
       res.setHeader('X-Node-Protocols', JSON.stringify(nodeProtocols));
       res.setHeader('X-Used-User-Agent', usedUA);
       res.setHeader('X-Proxy-Has-Subinfo', subInfo ? '1' : '0');
-      res.setHeader('X-Proxy-Content-Type', contentType);
-    } catch (e) {
-      console.warn(`[Vercel Proxy] 无法设置自定义响应头: ${e.message}`);
-    }
+    } catch {}
 
     if (buffer.byteLength > 0) {
-      const nodeReadable = Readable.from(Buffer.from(buffer));
-      nodeReadable.pipe(res);
-      console.log('[Vercel Proxy] 响应体已转发');
+      Readable.from(Buffer.from(buffer)).pipe(res);
     } else {
       res.end();
-      console.log('[Vercel Proxy] 目标响应体为空');
     }
   } catch (error) {
-    console.error(`[Vercel Proxy] 代理错误: ${error.message}`, {
-      stack: error.stack,
-      cause: error.cause ? {
-        message: error.cause.message,
-        code: error.cause.code,
-        errno: error.cause.errno,
-        syscall: error.cause.syscall
-      } : null
-    });
-
     let statusCode = 500;
     let errorMessage = `Vercel Proxy Error: ${error.message}`;
-    let errorBody = null;
 
-    if (error.cause && error.cause.response) {
-      statusCode = error.cause.response.status;
-      try {
-        errorBody = await error.cause.response.text();
-      } catch {}
-    } else if (String(error.message).includes('ECONNRESET')) {
+    if (String(error.message).includes('ECONNRESET')) {
       statusCode = 403;
       errorMessage = '访问被拒绝，可能IP被限制或订阅已失效';
     }
 
     res.statusCode = statusCode;
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-    res.end(errorBody || errorMessage);
+    res.end(errorMessage);
   }
 };
