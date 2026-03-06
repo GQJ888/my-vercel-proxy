@@ -1,8 +1,7 @@
-// =========================
-// worker.js（完整最终版）
+// worker.js
+// 完整最终版（文本可浏览，不强制下载）
 // KV: TEXT_STORAGE, LINK_META
 // ENV: ADMIN_TOKEN=zheshimima
-// =========================
 
 const PROXY_SERVER_URL = 'https://my-vercel-proxy-one.vercel.app/api/proxy';
 const YAML_CONVERT_API = 'https://dyzhapi.vercel.app/api/convert?clash&token=auto';
@@ -114,7 +113,12 @@ function copyHeadersRaw(upstreamHeaders, extra = {}, fallback = {}) {
 
   for (const [k, v] of upstreamHeaders.entries()) {
     const lk = k.toLowerCase();
-    if (lk === 'transfer-encoding' || lk === 'connection' || lk === 'content-length') continue;
+    if (
+      lk === 'transfer-encoding' ||
+      lk === 'connection' ||
+      lk === 'content-length' ||
+      lk === 'content-disposition'
+    ) continue;
     out.set(k, v);
   }
 
@@ -140,11 +144,18 @@ function copyHeadersRaw(upstreamHeaders, extra = {}, fallback = {}) {
   return out;
 }
 
-async function generateUniqueShortId(textKV, retries = 6) {
+function normalizeTextContentType() {
+  return 'text/plain; charset=utf-8';
+}
+
+async function generateUniqueShortId(textKV, metaKV, retries = 8) {
   for (let i = 0; i < retries; i++) {
     const shortId = generateCustomShortId(8);
-    const existingValue = await textKV.get(shortId);
-    if (existingValue === null) return shortId;
+    const [existsText, existsMeta] = await Promise.all([
+      textKV.get(shortId),
+      metaKV.get(shortId),
+    ]);
+    if (existsText === null && existsMeta === null) return shortId;
   }
   throw new Error('Failed to generate a unique short ID');
 }
@@ -236,7 +247,7 @@ async function fetchYamlFromSubscription(targetUrl) {
 
   return {
     body,
-    contentType: 'text/plain; charset=utf-8',
+    contentType: normalizeTextContentType(),
     contentDisposition: '',
   };
 }
@@ -254,12 +265,9 @@ function buildTextCustomHeaders(meta) {
   const subInfo = String(custom.subscriptionUserinfo || '').trim();
 
   if (subInfo) h.set('subscription-userinfo', subInfo);
-
   if (profileName) {
     h.set('profile-title', profileName);
     h.set('profile-name', profileName);
-    const filename = `${profileName}.yaml`;
-    h.set('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
   }
 
   return h;
@@ -268,10 +276,14 @@ function buildTextCustomHeaders(meta) {
 function buildProxyCustomHeaders(meta) {
   const h = new Headers();
   const profileName = String(meta?.custom?.profileName || '').trim();
+  const subInfo = String(meta?.custom?.subscriptionUserinfo || '').trim();
+
   if (profileName) {
     h.set('profile-title', profileName);
     h.set('profile-name', profileName);
   }
+  if (subInfo) h.set('subscription-userinfo', subInfo);
+
   return h;
 }
 
@@ -296,6 +308,7 @@ function buildListItemFromMeta(meta, shortId, origin) {
     updatedAt: meta?.updatedAt || '',
     cacheUpdatedAt: meta?.cacheUpdatedAt || '',
     custom: meta?.custom || null,
+    mode: meta?.mode || (type === 'proxy' ? 'raw' : ''),
   };
 }
 
@@ -310,6 +323,7 @@ function buildListItemLegacy(shortId, origin) {
     updatedAt: '',
     cacheUpdatedAt: '',
     custom: null,
+    mode: '',
   };
 }
 
@@ -513,6 +527,12 @@ async function listLegacyByPage(env, origin, page = 1, pageSize = 8, maxWalkPage
   };
 }
 
+function sanitizeCustomInput(profileNameRaw, subInfoRaw) {
+  const profileName = String(profileNameRaw || '').trim().slice(0, 64);
+  const subscriptionUserinfo = String(subInfoRaw || '').trim().slice(0, 512);
+  return { profileName, subscriptionUserinfo };
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -521,14 +541,13 @@ export default {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Filename, X-Profile-Name, X-Subscription-Userinfo',
-      'Access-Control-Expose-Headers': 'subscription-userinfo, profile-update-interval, profile-title, profile-name, content-disposition',
+      'Access-Control-Expose-Headers': 'subscription-userinfo, profile-update-interval, profile-title, profile-name',
     };
 
     if (request.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
     if (!env.TEXT_STORAGE) return textResponse('Missing KV binding: TEXT_STORAGE', 500, corsHeaders);
     if (!env.LINK_META) return textResponse('Missing KV binding: LINK_META', 500, corsHeaders);
 
-    // 主列表：全部短链 + kind 筛选
     if (url.pathname === '/api/admin/list' && request.method === 'GET') {
       if (!parseAuth(request, env)) return jsonResponse({ error: 'Unauthorized' }, 401, corsHeaders);
 
@@ -567,7 +586,6 @@ export default {
       }, 200, corsHeaders);
     }
 
-    // legacy 单独列表（保留）
     if (url.pathname === '/api/admin/legacy/list' && request.method === 'GET') {
       if (!parseAuth(request, env)) return jsonResponse({ error: 'Unauthorized' }, 401, corsHeaders);
 
@@ -675,13 +693,13 @@ export default {
           PROXY_SERVER_URL
         );
 
-        const subInfo = headerAny(response.headers, [
+        const originSubInfo = headerAny(response.headers, [
           'subscription-userinfo',
           'Subscription-Userinfo',
           'x-subscription-userinfo',
           'X-Subscription-Userinfo'
         ]);
-        const pui = headerAny(response.headers, [
+        const originPui = headerAny(response.headers, [
           'profile-update-interval',
           'Profile-Update-Interval',
           'x-profile-update-interval',
@@ -689,26 +707,23 @@ export default {
         ]);
 
         let finalBody;
-        let finalContentType = response.headers.get('content-type') || 'text/plain; charset=utf-8';
-        let finalContentDisposition = response.headers.get('content-disposition') || '';
-
         if (meta.mode === 'yaml') {
           const yamlResult = await fetchYamlFromSubscription(meta.targetUrl);
           finalBody = yamlResult.body;
-          finalContentType = 'text/plain; charset=utf-8';
-          finalContentDisposition = '';
         } else {
           finalBody = await response.arrayBuffer();
         }
 
         const now = nowIso();
+        const customSubInfo = String(meta?.custom?.subscriptionUserinfo || '').trim();
+        const finalSubInfo = customSubInfo || originSubInfo || '';
 
         meta.snapshot = {
           bodyBase64: encodeBase64FromArrayBuffer(finalBody),
-          contentType: finalContentType,
-          contentDisposition: finalContentDisposition,
-          subscriptionUserinfo: subInfo,
-          profileUpdateInterval: pui,
+          contentType: normalizeTextContentType(),
+          contentDisposition: '',
+          subscriptionUserinfo: finalSubInfo,
+          profileUpdateInterval: originPui,
           fetchedAt: now,
           upstreamStatus: response.status,
           usedUA,
@@ -722,10 +737,10 @@ export default {
 
         await env.LINK_META.put(`cache_${shortId}`, JSON.stringify({
           bodyBase64: encodeBase64FromArrayBuffer(finalBody),
-          contentType: finalContentType,
-          contentDisposition: finalContentDisposition,
-          subscriptionUserinfo: subInfo,
-          profileUpdateInterval: pui,
+          contentType: normalizeTextContentType(),
+          contentDisposition: '',
+          subscriptionUserinfo: finalSubInfo,
+          profileUpdateInterval: originPui,
           fetchedAt: now,
         }));
 
@@ -779,9 +794,10 @@ export default {
       if (body.clear === true) {
         delete metaNew.custom;
       } else {
+        const safe = sanitizeCustomInput(body.profileName, body.subscriptionUserinfo);
         metaNew.custom = {
-          profileName: String(body.profileName || '').trim(),
-          subscriptionUserinfo: String(body.subscriptionUserinfo || '').trim(),
+          profileName: safe.profileName,
+          subscriptionUserinfo: safe.subscriptionUserinfo,
         };
       }
 
@@ -791,7 +807,6 @@ export default {
       return jsonResponse({ ok: true, shortId }, 200, corsHeaders);
     }
 
-    // 文本短链创建（/sc /clash）
     if (
       (url.pathname === '/api/store/permanent' ||
         url.pathname === '/api/store/7d' ||
@@ -801,7 +816,7 @@ export default {
       const text = await request.text();
       if (!text) return textResponse('Text content is required.', 400, corsHeaders);
 
-      const shortId = await generateUniqueShortId(env.TEXT_STORAGE);
+      const shortId = await generateUniqueShortId(env.TEXT_STORAGE, env.LINK_META);
       await env.TEXT_STORAGE.put(shortId, text);
 
       const profileName = getHeaderTrimmed(request, ['X-Profile-Name', 'x-profile-name']);
@@ -819,9 +834,10 @@ export default {
       };
 
       if (profileName || subscriptionUserinfo) {
+        const safe = sanitizeCustomInput(profileName, subscriptionUserinfo);
         meta.custom = {
-          profileName,
-          subscriptionUserinfo,
+          profileName: safe.profileName,
+          subscriptionUserinfo: safe.subscriptionUserinfo,
         };
       }
 
@@ -829,84 +845,96 @@ export default {
       return jsonResponse({ shortLink: `${url.origin}/${shortId}` }, 200, corsHeaders);
     }
 
-    // proxy 短链创建（/dlzz）
     if (url.pathname === '/api/proxy/create' && request.method === 'POST') {
       const body = await request.json().catch(() => null);
-      const targetUrl = body?.targetUrl?.trim();
-      const profileName = String(body?.profileName || '').trim();
+      const targetUrl = String(body?.targetUrl || '').trim();
       const mode = String(body?.mode || 'raw').trim().toLowerCase() === 'yaml' ? 'yaml' : 'raw';
 
       if (!targetUrl) return jsonResponse({ error: 'targetUrl is required' }, 400, corsHeaders);
 
-      const shortId = await generateUniqueShortId(env.TEXT_STORAGE);
-      const now = nowIso();
-
-      const { response } = await fetchOriginWithRotation(targetUrl, getClientIp(request), 'GET', PROXY_SERVER_URL);
-
-      const originSubInfo = headerAny(response.headers, [
-        'subscription-userinfo',
-        'Subscription-Userinfo',
-        'x-subscription-userinfo',
-        'X-Subscription-Userinfo'
-      ]);
-
-      const originPui = headerAny(response.headers, [
-        'profile-update-interval',
-        'Profile-Update-Interval',
-        'x-profile-update-interval',
-        'X-Profile-Update-Interval'
-      ]);
-
-      let finalBody;
-      let finalContentType = response.headers.get('content-type') || 'text/plain; charset=utf-8';
-      let finalContentDisposition = response.headers.get('content-disposition') || '';
-
-      if (mode === 'yaml') {
-        const yamlResult = await fetchYamlFromSubscription(targetUrl);
-        finalBody = yamlResult.body;
-        finalContentType = 'text/plain; charset=utf-8';
-        finalContentDisposition = '';
-      } else {
-        finalBody = await response.arrayBuffer();
+      let parsed;
+      try {
+        parsed = new URL(targetUrl);
+      } catch {
+        return jsonResponse({ error: 'targetUrl is invalid' }, 400, corsHeaders);
+      }
+      if (!['http:', 'https:'].includes(parsed.protocol)) {
+        return jsonResponse({ error: 'targetUrl protocol must be http/https' }, 400, corsHeaders);
       }
 
-      const meta = {
-        type: 'proxy',
-        mode,
-        shortId,
-        targetUrl,
-        createdAt: now,
-        updatedAt: now,
-        cacheUpdatedAt: now,
-        lastStatus: response.status,
-        custom: profileName ? { profileName, subscriptionUserinfo: '' } : undefined,
-        snapshot: {
-          subscriptionUserinfo: originSubInfo,
-          profileUpdateInterval: originPui
+      const safe = sanitizeCustomInput(body?.profileName, body?.subscriptionUserinfo);
+
+      try {
+        const shortId = await generateUniqueShortId(env.TEXT_STORAGE, env.LINK_META);
+        const now = nowIso();
+
+        const { response } = await fetchOriginWithRotation(targetUrl, getClientIp(request), 'GET', PROXY_SERVER_URL);
+
+        const originSubInfo = headerAny(response.headers, [
+          'subscription-userinfo',
+          'Subscription-Userinfo',
+          'x-subscription-userinfo',
+          'X-Subscription-Userinfo'
+        ]);
+
+        const originPui = headerAny(response.headers, [
+          'profile-update-interval',
+          'Profile-Update-Interval',
+          'x-profile-update-interval',
+          'X-Profile-Update-Interval'
+        ]);
+
+        let finalBody;
+        if (mode === 'yaml') {
+          const yamlResult = await fetchYamlFromSubscription(targetUrl);
+          finalBody = yamlResult.body;
+        } else {
+          finalBody = await response.arrayBuffer();
         }
-      };
 
-      await saveMeta(env, shortId, meta);
-      await env.TEXT_STORAGE.put(shortId, PROXY_PLACEHOLDER);
+        const finalSubInfo = safe.subscriptionUserinfo || originSubInfo || '';
 
-      await env.LINK_META.put(`cache_${shortId}`, JSON.stringify({
-        bodyBase64: encodeBase64FromArrayBuffer(finalBody),
-        contentType: finalContentType,
-        contentDisposition: finalContentDisposition,
-        subscriptionUserinfo: originSubInfo,
-        profileUpdateInterval: originPui,
-        fetchedAt: now,
-      }));
+        const meta = {
+          type: 'proxy',
+          mode,
+          shortId,
+          targetUrl,
+          createdAt: now,
+          updatedAt: now,
+          cacheUpdatedAt: now,
+          lastStatus: response.status,
+          custom: (safe.profileName || safe.subscriptionUserinfo)
+            ? { profileName: safe.profileName, subscriptionUserinfo: safe.subscriptionUserinfo }
+            : undefined,
+          snapshot: {
+            subscriptionUserinfo: finalSubInfo,
+            profileUpdateInterval: originPui
+          }
+        };
 
-      return jsonResponse({
-        shortLink: `${url.origin}/${shortId}`,
-        type: 'proxy',
-        mode,
-        profileName: profileName || ''
-      }, 200, corsHeaders);
+        await saveMeta(env, shortId, meta);
+        await env.TEXT_STORAGE.put(shortId, PROXY_PLACEHOLDER);
+
+        await env.LINK_META.put(`cache_${shortId}`, JSON.stringify({
+          bodyBase64: encodeBase64FromArrayBuffer(finalBody),
+          contentType: normalizeTextContentType(),
+          contentDisposition: '',
+          subscriptionUserinfo: finalSubInfo,
+          profileUpdateInterval: originPui,
+          fetchedAt: now,
+        }));
+
+        return jsonResponse({
+          shortLink: `${url.origin}/${shortId}`,
+          type: 'proxy',
+          mode,
+          profileName: safe.profileName || ''
+        }, 200, corsHeaders);
+      } catch (e) {
+        return jsonResponse({ error: `create proxy failed: ${e.message}` }, 502, corsHeaders);
+      }
     }
 
-    // 访问短链
     if (request.method === 'GET') {
       const shortId = url.pathname.substring(1);
       if (shortId && !shortId.includes('/')) {
@@ -917,9 +945,9 @@ export default {
           if (!cached?.bodyBase64) return textResponse('Proxy cache missing. Refresh it.', 502, corsHeaders);
 
           const body = decodeBase64ToUint8Array(cached.bodyBase64);
+
           const fakeUpstream = new Headers();
-          if (cached.contentType) fakeUpstream.set('Content-Type', cached.contentType);
-          if (cached.contentDisposition) fakeUpstream.set('Content-Disposition', cached.contentDisposition);
+          fakeUpstream.set('Content-Type', normalizeTextContentType());
           if (cached.subscriptionUserinfo) fakeUpstream.set('subscription-userinfo', cached.subscriptionUserinfo);
           if (cached.profileUpdateInterval) fakeUpstream.set('profile-update-interval', cached.profileUpdateInterval);
 
@@ -928,15 +956,14 @@ export default {
           for (const [k, v] of proxyCustom.entries()) extra[k] = v;
 
           const headers = copyHeadersRaw(fakeUpstream, extra);
-          if (!headers.get('Content-Type')) headers.set('Content-Type', cached.contentType || 'text/plain; charset=utf-8');
-          if (cached.contentDisposition) headers.set('Content-Disposition', cached.contentDisposition);
+          headers.set('Content-Type', normalizeTextContentType());
 
           return new Response(body, { status: 200, headers });
         }
 
         const text = await env.TEXT_STORAGE.get(shortId);
         if (text && text !== PROXY_PLACEHOLDER) {
-          const headers = new Headers({ 'Content-Type': 'text/plain; charset=utf-8', ...corsHeaders });
+          const headers = new Headers({ 'Content-Type': normalizeTextContentType(), ...corsHeaders });
           const customHeaders = buildTextCustomHeaders(meta);
           for (const [k, v] of customHeaders.entries()) headers.set(k, v);
           return new Response(text, { status: 200, headers });
