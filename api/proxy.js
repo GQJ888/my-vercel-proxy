@@ -8,9 +8,9 @@ const YAML_CONVERT_API = 'https://dyzhapi.vercel.app/api/convert?clash&token=aut
 const PROXY_PLACEHOLDER = '__proxy_link_placeholder__';
 
 const USER_AGENTS = [
-  'Mozilla/5.0 (Windows NT 10.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
   'Clash Verge/v1.7.8',
   'Shadowrocket/1872 CFNetwork/1408.0.4 Darwin/22.5.0',
+  'Mozilla/5.0 (Windows NT 10.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
   'ClashforWindows/0.20.39',
 ];
 
