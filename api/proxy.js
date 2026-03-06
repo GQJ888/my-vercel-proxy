@@ -1,321 +1,951 @@
-const { URL } = require('url');
-const { Readable } = require('stream');
-const { ungzip } = require('pako');
-const { load } = require('js-yaml');
+// =========================
+// worker.js（完整最终版）
+// KV: TEXT_STORAGE, LINK_META
+// ENV: ADMIN_TOKEN=zheshimima
+// =========================
 
-const SUPPORTED_PROTOCOLS = [
-  'ss', 'ssr', 'trojan', 'vmess', 'vless', 'http', 'socks5',
-  'hysteria', 'hysteria2', 'tuic', 'wireguard', 'brook', 'snell',
-  'reality', 'juicity', 'xray', 'shadowtls', 'v2ray', 'outline',
-  'warp', 'naive', 'httpobfs', 'websocket', 'quic', 'grpc', 'http2', 'http3'
-];
+const PROXY_SERVER_URL = 'https://my-vercel-proxy-one.vercel.app/api/proxy';
+const YAML_CONVERT_API = 'https://dyzhapi.vercel.app/api/convert?clash&token=auto';
+const PROXY_PLACEHOLDER = '__proxy_link_placeholder__';
 
 const USER_AGENTS = [
+  'Mozilla/5.0 (Windows NT 10.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
+  'Clash Verge/v1.7.8',
   'Shadowrocket/1872 CFNetwork/1408.0.4 Darwin/22.5.0',
   'ClashforWindows/0.20.39',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
 ];
 
-const EXPOSE_HEADERS = [
-  'subscription-userinfo',
-  'profile-update-interval',
-  'X-Node-Protocols',
-  'X-Used-User-Agent',
-  'X-Proxy-Has-SubInfo'
-].join(', ');
-
-function getClientIp(req) {
-  const xff = req.headers['x-forwarded-for'];
-  if (xff && typeof xff === 'string') return xff.split(',')[0].trim();
-  const xr = req.headers['x-real-ip'];
-  if (xr && typeof xr === 'string') return xr.trim();
-  return req.socket?.remoteAddress || '';
+function nowIso() {
+  return new Date().toISOString();
 }
 
-async function fetchWithUARotation(targetUrl, req, maxRetriesPerUA = 2) {
+function generateCustomShortId(length = 8) {
+  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  const randomValues = new Uint8Array(length);
+  crypto.getRandomValues(randomValues);
+  return Array.from(randomValues, v => chars[v % chars.length]).join('');
+}
+
+function encodeBase64FromArrayBuffer(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
+
+function decodeBase64ToUint8Array(b64) {
+  const binary = atob(b64);
+  const len = binary.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function jsonResponse(data, status = 200, headers = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json; charset=utf-8', ...headers },
+  });
+}
+
+function textResponse(text, status = 200, headers = {}) {
+  return new Response(text, {
+    status,
+    headers: { 'Content-Type': 'text/plain; charset=utf-8', ...headers },
+  });
+}
+
+function parseAuth(request, env) {
+  const required = (env.ADMIN_TOKEN || '').trim();
+  if (!required) return true;
+  const auth = (request.headers.get('Authorization') || request.headers.get('authorization') || '').trim();
+  if (!auth.toLowerCase().startsWith('bearer ')) return false;
+  return auth.slice(7).trim() === required;
+}
+
+function getClientIp(request) {
+  const xff = request.headers.get('x-forwarded-for');
+  if (!xff) return '';
+  return xff.split(',')[0].trim();
+}
+
+function isIPv4(hostname) {
+  const ipv4Regex = /^(\d{1,3}\.){3}\d{1,3}$/;
+  return ipv4Regex.test(hostname) && hostname.split('.').every(part => {
+    const n = Number(part);
+    return n >= 0 && n <= 255;
+  });
+}
+
+function isIPv6(hostname) {
+  return hostname.includes(':');
+}
+
+function buildUpstreamUrl(targetUrl, proxyServerUrl) {
+  const u = new URL(targetUrl);
+  if ((isIPv4(u.hostname) || isIPv6(u.hostname)) && proxyServerUrl) {
+    return `${proxyServerUrl}?url=${encodeURIComponent(targetUrl)}`;
+  }
+  return targetUrl;
+}
+
+function headerAny(headers, keys) {
+  for (const k of keys) {
+    const v = headers.get(k);
+    if (v !== null && v !== undefined) return v;
+  }
+  return '';
+}
+
+function getHeaderTrimmed(request, names) {
+  for (const name of names) {
+    const v = request.headers.get(name);
+    if (v && String(v).trim()) return String(v).trim();
+  }
+  return '';
+}
+
+function copyHeadersRaw(upstreamHeaders, extra = {}, fallback = {}) {
+  const out = new Headers();
+
+  for (const [k, v] of upstreamHeaders.entries()) {
+    const lk = k.toLowerCase();
+    if (lk === 'transfer-encoding' || lk === 'connection' || lk === 'content-length') continue;
+    out.set(k, v);
+  }
+
+  const subInfo =
+    headerAny(upstreamHeaders, [
+      'subscription-userinfo',
+      'Subscription-Userinfo',
+      'x-subscription-userinfo',
+      'X-Subscription-Userinfo'
+    ]) || fallback.subscriptionUserinfo || '';
+  if (subInfo) out.set('subscription-userinfo', subInfo);
+
+  const pui =
+    headerAny(upstreamHeaders, [
+      'profile-update-interval',
+      'Profile-Update-Interval',
+      'x-profile-update-interval',
+      'X-Profile-Update-Interval'
+    ]) || fallback.profileUpdateInterval || '';
+  if (pui) out.set('profile-update-interval', pui);
+
+  for (const [k, v] of Object.entries(extra)) out.set(k, String(v));
+  return out;
+}
+
+async function generateUniqueShortId(textKV, retries = 6) {
+  for (let i = 0; i < retries; i++) {
+    const shortId = generateCustomShortId(8);
+    const existingValue = await textKV.get(shortId);
+    if (existingValue === null) return shortId;
+  }
+  throw new Error('Failed to generate a unique short ID');
+}
+
+async function getMeta(env, shortId) {
+  const raw = await env.LINK_META.get(shortId);
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
+async function saveMeta(env, shortId, metaObj) {
+  await env.LINK_META.put(shortId, JSON.stringify(metaObj));
+}
+
+async function fetchOriginWithRotation(targetUrl, clientIp = '', method = 'GET', proxyServerUrl = '') {
   let lastError = null;
-  const clientIp = getClientIp(req);
+  const finalUrl = buildUpstreamUrl(targetUrl, proxyServerUrl);
 
-  for (let uaIndex = 0; uaIndex < USER_AGENTS.length; uaIndex++) {
-    const ua = USER_AGENTS[uaIndex];
+  for (let uaIdx = 0; uaIdx < USER_AGENTS.length; uaIdx++) {
+    const ua = USER_AGENTS[uaIdx];
 
-    for (let attempt = 1; attempt <= maxRetriesPerUA; attempt++) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        const proxyHeaders = {
-          'User-Agent': ua,
-          'Accept': '*/*',
-          'Accept-Encoding': 'gzip',
-          'Cache-Control': 'no-cache',
-          'Pragma': 'no-cache',
-          'X-Forwarded-For': clientIp
-        };
-
-        console.log(`[Vercel Proxy] 尝试 UA(${uaIndex + 1}/${USER_AGENTS.length}) 第 ${attempt} 次: ${ua}`);
-
-        const response = await fetch(targetUrl, {
-          method: req.method,
-          headers: proxyHeaders,
-          body: (req.method !== 'GET' && req.method !== 'HEAD') ? req : undefined,
+        const resp = await fetch(finalUrl, {
+          method,
+          headers: {
+            'User-Agent': ua,
+            'Accept': '*/*',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
+            'X-Forwarded-For': clientIp || '',
+          },
           redirect: 'follow',
-          signal: AbortSignal.timeout(10000)
+          signal: AbortSignal.timeout(12000),
         });
 
-        if ([403, 429, 503].includes(response.status)) {
-          console.warn(`[Vercel Proxy] 状态码 ${response.status}，切换下一个 UA`);
-          lastError = new Error(`HTTP ${response.status} (UA blocked: ${ua})`);
+        if (resp.ok) return { response: resp, usedUA: ua, fetchedUrl: finalUrl };
+
+        if ([403, 429, 503].includes(resp.status)) {
+          lastError = new Error(`HTTP ${resp.status} blocked by upstream`);
           break;
         }
 
-        const hasSubInfo = !!(
-          response.headers.get('subscription-userinfo') ||
-          response.headers.get('Subscription-Userinfo') ||
-          response.headers.get('x-subscription-userinfo') ||
-          response.headers.get('X-Subscription-Userinfo')
-        );
-
-        if (response.ok && hasSubInfo) {
-          console.log('[Vercel Proxy] 获取到流量头，返回响应');
-          return { response, usedUA: ua, uaIndex };
-        }
-
-        if (response.ok && !hasSubInfo && uaIndex < USER_AGENTS.length - 1) {
-          console.warn('[Vercel Proxy] 200 但无流量头，尝试下一个 UA');
-          lastError = new Error('No subscription headers');
-          break;
-        }
-
-        if (!response.ok) {
-          if (attempt < maxRetriesPerUA) {
-            const waitMs = 700 * attempt;
-            console.warn(`[Vercel Proxy] HTTP ${response.status}，${waitMs}ms 后重试同UA`);
-            await new Promise(r => setTimeout(r, waitMs));
-            continue;
-          }
-          lastError = new Error(`HTTP ${response.status}`);
-          break;
-        }
-
-        return { response, usedUA: ua, uaIndex };
-
-      } catch (error) {
-        lastError = error;
-        console.warn(`[Vercel Proxy] UA请求异常: ${error.message}`);
-
-        if (attempt < maxRetriesPerUA) {
-          const waitMs = 1000 * attempt;
-          await new Promise(r => setTimeout(r, waitMs));
+        if (attempt < 2) {
+          await new Promise(r => setTimeout(r, 700 * attempt));
           continue;
         }
 
-        if (uaIndex < USER_AGENTS.length - 1) {
-          await new Promise(r => setTimeout(r, 500));
+        lastError = new Error(`HTTP ${resp.status}`);
+      } catch (e) {
+        lastError = e;
+        if (attempt < 2) {
+          await new Promise(r => setTimeout(r, 900 * attempt));
+          continue;
         }
       }
     }
+
+    if (uaIdx < USER_AGENTS.length - 1) {
+      await new Promise(r => setTimeout(r, 250));
+    }
   }
 
-  throw lastError || new Error('All User-Agents failed');
+  throw lastError || new Error('All UA requests failed');
 }
 
-module.exports = async (req, res) => {
-  try {
-    if (req.method === 'OPTIONS') {
-      res.statusCode = 204;
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, subscription-userinfo, profile-update-interval');
-      res.setHeader('Access-Control-Expose-Headers', EXPOSE_HEADERS);
-      res.end();
-      return;
-    }
+async function fetchYamlFromSubscription(targetUrl) {
+  const convertUrl = `${YAML_CONVERT_API}&sub=${encodeURIComponent(targetUrl)}`;
+  const resp = await fetch(convertUrl, {
+    method: 'GET',
+    headers: {
+      'User-Agent': 'clash-verge/v1.5.1',
+      'Accept': '*/*',
+    },
+    signal: AbortSignal.timeout(15000),
+  });
 
-    const requestUrl = new URL(req.url, `http://${req.headers.host}`);
-    const targetUrl = requestUrl.searchParams.get('url');
-
-    if (!targetUrl) {
-      res.statusCode = 400;
-      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Access-Control-Expose-Headers', EXPOSE_HEADERS);
-      res.end('Bad Request: "url" parameter is missing.');
-      return;
-    }
-
-    console.log(`[Vercel Proxy] 收到请求，目标URL: ${targetUrl}`);
-
-    const { response, usedUA } = await fetchWithUARotation(targetUrl, req, 2);
-
-    console.log(`[Vercel Proxy] 收到响应，状态码: ${response.status}`);
-
-    const contentEncoding = response.headers.get('content-encoding') || '';
-    const buffer = await response.arrayBuffer();
-
-    let contentString;
-    const decoder = new TextDecoder('utf-8', { fatal: false });
-
-    if (contentEncoding.includes('gzip')) {
-      try {
-        contentString = ungzip(new Uint8Array(buffer), { to: 'string' });
-        console.log('[Vercel Proxy] GZIP 解压缩成功');
-      } catch (error) {
-        console.error('[Vercel Proxy] GZIP 解压失败:', error.message);
-        contentString = decoder.decode(buffer);
-      }
-    } else {
-      contentString = decoder.decode(buffer);
-    }
-
-    let nodeProtocols = { total: 0, protocols: {} };
-    try {
-      let textToParse = contentString;
-      let isClashYaml = false;
-
-      try {
-        const decoded = Buffer.from(textToParse, 'base64').toString('utf8');
-        if (decoded.includes('://') || decoded.includes('proxies:')) {
-          textToParse = decoded;
-          console.log('[Vercel Proxy] Base64 解码成功');
-        }
-      } catch (e) {
-        console.log('[Vercel Proxy] Base64 解码失败，忽略:', e.message);
-      }
-
-      try {
-        if (textToParse.includes('proxies:') && textToParse.includes('proxy-groups:')) {
-          const config = load(textToParse);
-          if (config && config.proxies && Array.isArray(config.proxies)) {
-            isClashYaml = true;
-          }
-        }
-      } catch (error) {
-        console.warn('[Vercel Proxy] YAML 解析失败，按普通节点列表处理:', error.message);
-      }
-
-      if (isClashYaml) {
-        const config = load(textToParse);
-        config.proxies.forEach(proxy => {
-          const protocol = proxy.type ? proxy.type.toLowerCase() : 'unknown';
-          nodeProtocols.protocols[protocol] = (nodeProtocols.protocols[protocol] || 0) + 1;
-          nodeProtocols.total++;
-        });
-      } else {
-        const lines = textToParse.split('\n');
-        for (const line of lines) {
-          const trimmedLine = line.trim();
-          if (!trimmedLine) continue;
-          for (const proto of SUPPORTED_PROTOCOLS) {
-            if (trimmedLine.toLowerCase().startsWith(`${proto}://`)) {
-              nodeProtocols.protocols[proto] = (nodeProtocols.protocols[proto] || 0) + 1;
-              nodeProtocols.total++;
-              break;
-            }
-          }
-        }
-      }
-
-      console.log(`[Vercel Proxy] 节点协议解析结果: ${JSON.stringify(nodeProtocols, null, 2)}`);
-    } catch (error) {
-      console.error(`[Vercel Proxy] 节点协议解析失败: ${error.message}`);
-      nodeProtocols = { total: 0, protocols: {} };
-    }
-
-    res.statusCode = response.status;
-
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Expose-Headers', EXPOSE_HEADERS);
-
-    // 原样透传响应头（过滤 hop-by-hop & content-length）
-    for (const [key, value] of response.headers.entries()) {
-      const lowerCaseKey = key.toLowerCase();
-      if (!['transfer-encoding', 'connection', 'keep-alive', 'content-length'].includes(lowerCaseKey)) {
-        try {
-          res.setHeader(key, value);
-          console.log(`[Vercel Proxy] 转发响应头: ${key}: ${value}`);
-        } catch (e) {
-          console.warn(`[Vercel Proxy] 无法设置响应头 '${key}': ${e.message}`);
-        }
-      }
-    }
-
-    // 关键：强制补写小写的 subscription-userinfo（与机器人保持一致）
-    const subInfo =
-      response.headers.get('subscription-userinfo') ||
-      response.headers.get('Subscription-Userinfo') ||
-      response.headers.get('x-subscription-userinfo') ||
-      response.headers.get('X-Subscription-Userinfo') ||
-      '';
-
-    if (subInfo) {
-      res.setHeader('subscription-userinfo', subInfo);
-    }
-
-    // 关键：强制补写小写的 profile-update-interval
-    const pui =
-      response.headers.get('profile-update-interval') ||
-      response.headers.get('Profile-Update-Interval') ||
-      response.headers.get('x-profile-update-interval') ||
-      response.headers.get('X-Profile-Update-Interval') ||
-      '';
-
-    if (pui) {
-      res.setHeader('profile-update-interval', pui);
-    }
-
-    try {
-      res.setHeader('X-Node-Protocols', JSON.stringify(nodeProtocols));
-      res.setHeader('X-Used-User-Agent', usedUA);
-      res.setHeader('X-Proxy-Has-SubInfo', subInfo ? '1' : '0');
-      console.log(`[Vercel Proxy] 添加 X-Node-Protocols / X-Used-User-Agent / X-Proxy-Has-SubInfo`);
-    } catch (e) {
-      console.warn(`[Vercel Proxy] 无法设置自定义响应头: ${e.message}`);
-    }
-
-    if (buffer.byteLength > 0) {
-      const nodeReadable = Readable.from(Buffer.from(buffer));
-      nodeReadable.pipe(res);
-      console.log('[Vercel Proxy] 响应体通过管道流转发。');
-    } else {
-      res.end();
-      console.log('[Vercel Proxy] 目标响应体为空。');
-    }
-
-  } catch (error) {
-    console.error(`[Vercel Proxy] 代理错误: ${error.message}`, {
-      stack: error.stack,
-      cause: error.cause ? {
-        message: error.cause.message,
-        code: error.cause.code,
-        errno: error.cause.errno,
-        syscall: error.cause.syscall
-      } : null
-    });
-
-    let statusCode = 500;
-    let errorMessage = `Vercel Proxy Error: ${error.message}`;
-    let errorBody = null;
-
-    if (error.cause && error.cause.response) {
-      statusCode = error.cause.response.status;
-      console.log(`[Vercel Proxy] 目标服务器错误详情: 状态码 ${statusCode}`);
-      for (const [key, value] of error.cause.response.headers.entries()) {
-        console.log(`  ${key}: ${value}`);
-      }
-      try {
-        errorBody = await error.cause.response.text();
-        console.log(`[Vercel Proxy] 错误响应体: ${errorBody.substring(0, 200)}...`);
-      } catch (bodyError) {
-        console.error('[Vercel Proxy] 无法读取错误响应体:', bodyError);
-      }
-    } else if (error.message.includes('ECONNRESET')) {
-      statusCode = 403;
-      errorMessage = '访问被拒绝，可能IP被限制或订阅已失效';
-      console.log('[Vercel Proxy] 推测目标服务器返回 403 (ECONNRESET)');
-    }
-
-    res.statusCode = statusCode;
-    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Expose-Headers', EXPOSE_HEADERS);
-    res.end(errorBody || errorMessage);
+  if (!resp.ok) {
+    throw new Error(`yaml convert failed: HTTP ${resp.status}`);
   }
+
+  const body = await resp.arrayBuffer();
+  const text = new TextDecoder().decode(body);
+
+  if (!text.includes('proxies:') || !text.includes('proxy-groups:')) {
+    throw new Error('yaml convert failed: invalid clash yaml');
+  }
+
+  return {
+    body,
+    contentType: 'text/plain; charset=utf-8',
+    contentDisposition: '',
+  };
+}
+
+function isCacheKey(name) {
+  return name.startsWith('cache_');
+}
+
+function buildTextCustomHeaders(meta) {
+  const h = new Headers();
+  const custom = meta?.custom || null;
+  if (!custom) return h;
+
+  const profileName = String(custom.profileName || '').trim();
+  const subInfo = String(custom.subscriptionUserinfo || '').trim();
+
+  if (subInfo) h.set('subscription-userinfo', subInfo);
+
+  if (profileName) {
+    h.set('profile-title', profileName);
+    h.set('profile-name', profileName);
+    const filename = `${profileName}.yaml`;
+    h.set('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
+  }
+
+  return h;
+}
+
+function buildProxyCustomHeaders(meta) {
+  const h = new Headers();
+  const profileName = String(meta?.custom?.profileName || '').trim();
+  if (profileName) {
+    h.set('profile-title', profileName);
+    h.set('profile-name', profileName);
+  }
+  return h;
+}
+
+function buildListItemFromMeta(meta, shortId, origin) {
+  const type = meta?.type || 'text';
+  const customName = String(meta?.custom?.profileName || '').trim();
+
+  let targetDisplay = '';
+  if (type === 'proxy') {
+    targetDisplay = customName || String(meta?.targetUrl || '');
+  } else {
+    targetDisplay = '文本';
+  }
+
+  return {
+    id: shortId,
+    shortLink: `${origin}/${shortId}`,
+    type,
+    targetUrl: targetDisplay,
+    rawTargetUrl: type === 'proxy' ? (meta?.targetUrl || '') : '',
+    status: meta?.lastStatus ?? null,
+    updatedAt: meta?.updatedAt || '',
+    cacheUpdatedAt: meta?.cacheUpdatedAt || '',
+    custom: meta?.custom || null,
+  };
+}
+
+function buildListItemLegacy(shortId, origin) {
+  return {
+    id: shortId,
+    shortLink: `${origin}/${shortId}`,
+    type: 'text_legacy',
+    targetUrl: '文本',
+    rawTargetUrl: '',
+    status: null,
+    updatedAt: '',
+    cacheUpdatedAt: '',
+    custom: null,
+  };
+}
+
+async function getAllShortIds(env) {
+  const metaIds = [];
+  let metaCursor;
+
+  while (true) {
+    const listed = await env.LINK_META.list({ limit: 1000, cursor: metaCursor });
+    for (const k of listed.keys || []) {
+      if (!isCacheKey(k.name)) metaIds.push(k.name);
+    }
+    if (listed.list_complete) break;
+    metaCursor = listed.cursor;
+  }
+
+  const metaSet = new Set(metaIds);
+  const legacyIds = [];
+  let textCursor;
+
+  while (true) {
+    const listed = await env.TEXT_STORAGE.list({ limit: 1000, cursor: textCursor });
+    for (const k of listed.keys || []) {
+      if (metaSet.has(k.name)) continue;
+      const val = await env.TEXT_STORAGE.get(k.name);
+      if (val !== null && val !== PROXY_PLACEHOLDER) legacyIds.push(k.name);
+    }
+    if (listed.list_complete) break;
+    textCursor = listed.cursor;
+  }
+
+  const all = [...metaIds, ...legacyIds];
+  all.sort((a, b) => b.localeCompare(a));
+  return all;
+}
+
+function paginateArrayByCursor(allIds, limit = 8, cursor = '') {
+  const safeLimit = Math.max(1, Math.min(50, limit));
+  let startIndex = 0;
+
+  if (cursor) {
+    const idx = parseInt(cursor, 10);
+    if (!Number.isNaN(idx) && idx >= 0 && idx < allIds.length) {
+      startIndex = idx;
+    }
+  }
+
+  const pageItems = allIds.slice(startIndex, startIndex + safeLimit);
+  const nextIndex = startIndex + safeLimit;
+  const nextCursor = nextIndex < allIds.length ? String(nextIndex) : null;
+
+  return {
+    pageItems,
+    nextCursor,
+    listComplete: nextCursor === null,
+    startIndex,
+  };
+}
+
+async function buildListItemsFromIds(env, ids, origin) {
+  const items = [];
+  for (const shortId of ids) {
+    const meta = await getMeta(env, shortId);
+    if (meta) items.push(buildListItemFromMeta(meta, shortId, origin));
+    else items.push(buildListItemLegacy(shortId, origin));
+  }
+  return items;
+}
+
+async function filterIdsByKind(env, allIds, kind = 'all') {
+  if (kind === 'all') return allIds;
+
+  const filtered = [];
+  for (const shortId of allIds) {
+    const meta = await getMeta(env, shortId);
+
+    if (kind === 'proxy') {
+      if (meta?.type === 'proxy') filtered.push(shortId);
+      continue;
+    }
+
+    if (kind === 'text') {
+      if (!meta) {
+        const val = await env.TEXT_STORAGE.get(shortId);
+        if (val !== null && val !== PROXY_PLACEHOLDER) filtered.push(shortId);
+      } else if (meta.type !== 'proxy') {
+        filtered.push(shortId);
+      }
+      continue;
+    }
+
+    filtered.push(shortId);
+  }
+  return filtered;
+}
+
+async function listAllByCursor(env, origin, limit = 8, cursor = '', kind = 'all') {
+  const allIds = await getAllShortIds(env);
+  const filteredIds = await filterIdsByKind(env, allIds, kind);
+  const paged = paginateArrayByCursor(filteredIds, limit, cursor);
+  const items = await buildListItemsFromIds(env, paged.pageItems, origin);
+
+  return {
+    items,
+    cursor: paged.nextCursor,
+    listComplete: paged.listComplete,
+    total: filteredIds.length,
+    startIndex: paged.startIndex,
+  };
+}
+
+async function listAllByPage(env, origin, page = 1, pageSize = 8, maxWalkPages = 50, kind = 'all') {
+  const safePage = Math.max(1, page);
+  const safeSize = Math.max(1, Math.min(50, pageSize));
+  const allIds = await getAllShortIds(env);
+  const filteredIds = await filterIdsByKind(env, allIds, kind);
+
+  let note = '';
+  const pageLimited = safePage > maxWalkPages ? maxWalkPages : safePage;
+  if (safePage > maxWalkPages) {
+    note = `page 跳页最多走 ${maxWalkPages} 页，已限制到第 ${maxWalkPages} 页`;
+  }
+
+  const startIndex = (pageLimited - 1) * safeSize;
+  const pageIds = filteredIds.slice(startIndex, startIndex + safeSize);
+  const items = await buildListItemsFromIds(env, pageIds, origin);
+  const nextCursor = startIndex + safeSize < filteredIds.length ? String(startIndex + safeSize) : null;
+
+  return {
+    items,
+    page: pageLimited,
+    pageSize: safeSize,
+    total: filteredIds.length,
+    totalPages: Math.max(1, Math.ceil(filteredIds.length / safeSize)),
+    startIndex,
+    cursor: nextCursor,
+    note,
+  };
+}
+
+async function listLegacyIds(env) {
+  const ids = [];
+  let cursor;
+
+  while (true) {
+    const listed = await env.TEXT_STORAGE.list({ limit: 1000, cursor });
+    for (const k of listed.keys || []) {
+      const shortId = k.name;
+      const meta = await getMeta(env, shortId);
+      if (meta) continue;
+      const val = await env.TEXT_STORAGE.get(shortId);
+      if (val !== null && val !== PROXY_PLACEHOLDER) ids.push(shortId);
+    }
+    if (listed.list_complete) break;
+    cursor = listed.cursor;
+  }
+
+  ids.sort((a, b) => b.localeCompare(a));
+  return ids;
+}
+
+async function listLegacyCursor(env, origin, limit = 8, cursor = '') {
+  const allIds = await listLegacyIds(env);
+  const paged = paginateArrayByCursor(allIds, limit, cursor);
+  const items = paged.pageItems.map(id => buildListItemLegacy(id, origin));
+
+  return {
+    items,
+    cursor: paged.nextCursor,
+    listComplete: paged.listComplete,
+    total: allIds.length,
+    startIndex: paged.startIndex,
+  };
+}
+
+async function listLegacyByPage(env, origin, page = 1, pageSize = 8, maxWalkPages = 50) {
+  const safePage = Math.max(1, page);
+  const safeSize = Math.max(1, Math.min(50, pageSize));
+  const allIds = await listLegacyIds(env);
+
+  let note = '';
+  const pageLimited = safePage > maxWalkPages ? maxWalkPages : safePage;
+  if (safePage > maxWalkPages) {
+    note = `page 跳页最多走 ${maxWalkPages} 页，已限制到第 ${maxWalkPages} 页`;
+  }
+
+  const startIndex = (pageLimited - 1) * safeSize;
+  const pageIds = allIds.slice(startIndex, startIndex + safeSize);
+  const items = pageIds.map(id => buildListItemLegacy(id, origin));
+  const nextCursor = startIndex + safeSize < allIds.length ? String(startIndex + safeSize) : null;
+
+  return {
+    items,
+    page: pageLimited,
+    pageSize: safeSize,
+    total: allIds.length,
+    totalPages: Math.max(1, Math.ceil(allIds.length / safeSize)),
+    startIndex,
+    cursor: nextCursor,
+    note,
+  };
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+
+    const corsHeaders = {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Filename, X-Profile-Name, X-Subscription-Userinfo',
+      'Access-Control-Expose-Headers': 'subscription-userinfo, profile-update-interval, profile-title, profile-name, content-disposition',
+    };
+
+    if (request.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
+    if (!env.TEXT_STORAGE) return textResponse('Missing KV binding: TEXT_STORAGE', 500, corsHeaders);
+    if (!env.LINK_META) return textResponse('Missing KV binding: LINK_META', 500, corsHeaders);
+
+    // 主列表：全部短链 + kind 筛选
+    if (url.pathname === '/api/admin/list' && request.method === 'GET') {
+      if (!parseAuth(request, env)) return jsonResponse({ error: 'Unauthorized' }, 401, corsHeaders);
+
+      const limit = Math.max(1, Math.min(50, parseInt(url.searchParams.get('limit') || '8', 10) || 8));
+      const cursor = url.searchParams.get('cursor') || '';
+      const page = parseInt(url.searchParams.get('page') || '0', 10) || 0;
+      const kindRaw = String(url.searchParams.get('kind') || 'all').trim().toLowerCase();
+      const kind = ['all', 'text', 'proxy'].includes(kindRaw) ? kindRaw : 'all';
+
+      if (page > 0) {
+        const data = await listAllByPage(env, url.origin, page, limit, 50, kind);
+        return jsonResponse({
+          items: data.items,
+          page: data.page,
+          totalPages: data.totalPages,
+          total: data.total,
+          startIndex: data.startIndex + 1,
+          pageSize: data.pageSize,
+          cursor: data.cursor,
+          note: data.note || '',
+          mode: 'page',
+          kind,
+        }, 200, corsHeaders);
+      }
+
+      const data = await listAllByCursor(env, url.origin, limit, cursor, kind);
+      return jsonResponse({
+        items: data.items,
+        cursor: data.cursor,
+        listComplete: data.listComplete,
+        total: data.total,
+        startIndex: data.startIndex + 1,
+        pageSize: limit,
+        mode: 'cursor',
+        kind,
+      }, 200, corsHeaders);
+    }
+
+    // legacy 单独列表（保留）
+    if (url.pathname === '/api/admin/legacy/list' && request.method === 'GET') {
+      if (!parseAuth(request, env)) return jsonResponse({ error: 'Unauthorized' }, 401, corsHeaders);
+
+      const limit = Math.max(1, Math.min(50, parseInt(url.searchParams.get('limit') || '8', 10) || 8));
+      const cursor = url.searchParams.get('cursor') || '';
+      const page = parseInt(url.searchParams.get('page') || '0', 10) || 0;
+
+      if (page > 0) {
+        const data = await listLegacyByPage(env, url.origin, page, limit, 50);
+        return jsonResponse({
+          items: data.items,
+          page: data.page,
+          totalPages: data.totalPages,
+          total: data.total,
+          startIndex: data.startIndex + 1,
+          pageSize: data.pageSize,
+          cursor: data.cursor,
+          note: data.note || '',
+          mode: 'page',
+        }, 200, corsHeaders);
+      }
+
+      const data = await listLegacyCursor(env, url.origin, limit, cursor);
+      return jsonResponse({
+        items: data.items,
+        cursor: data.cursor,
+        listComplete: data.listComplete,
+        total: data.total,
+        startIndex: data.startIndex + 1,
+        pageSize: limit,
+        mode: 'cursor',
+      }, 200, corsHeaders);
+    }
+
+    if (url.pathname.startsWith('/api/admin/detail/') && request.method === 'GET') {
+      if (!parseAuth(request, env)) return jsonResponse({ error: 'Unauthorized' }, 401, corsHeaders);
+
+      const shortId = decodeURIComponent(url.pathname.replace('/api/admin/detail/', '').trim());
+      if (!shortId) return jsonResponse({ error: 'Invalid shortId' }, 400, corsHeaders);
+
+      const meta = await getMeta(env, shortId);
+      const shortLink = `${url.origin}/${shortId}`;
+
+      if (!meta) {
+        const text = await env.TEXT_STORAGE.get(shortId);
+        if (text === null) return jsonResponse({ error: 'Not found' }, 404, corsHeaders);
+        return jsonResponse({
+          meta: {
+            type: 'text_legacy',
+            shortId,
+            targetUrl: '文本',
+            custom: null
+          },
+          cache: null,
+          shortLink
+        }, 200, corsHeaders);
+      }
+
+      const cache = await env.LINK_META.get(`cache_${shortId}`, { type: 'json' });
+      const safeMeta = {
+        ...meta,
+        mode: meta.mode || 'raw',
+        targetUrl: meta.type === 'proxy'
+          ? (String(meta?.custom?.profileName || '').trim() || meta.targetUrl || '')
+          : '文本',
+      };
+
+      return jsonResponse({ meta: safeMeta, cache: cache || null, shortLink }, 200, corsHeaders);
+    }
+
+    if (url.pathname.startsWith('/api/admin/delete/') && request.method === 'DELETE') {
+      if (!parseAuth(request, env)) return jsonResponse({ error: 'Unauthorized' }, 401, corsHeaders);
+
+      const shortId = decodeURIComponent(url.pathname.replace('/api/admin/delete/', '').trim());
+      if (!shortId) return jsonResponse({ error: 'Invalid shortId' }, 400, corsHeaders);
+
+      await env.TEXT_STORAGE.delete(shortId);
+      await env.LINK_META.delete(shortId);
+      await env.LINK_META.delete(`cache_${shortId}`);
+      return jsonResponse({ ok: true, shortId }, 200, corsHeaders);
+    }
+
+    if (url.pathname.startsWith('/api/admin/refresh/') && request.method === 'POST') {
+      if (!parseAuth(request, env)) return jsonResponse({ error: 'Unauthorized' }, 401, corsHeaders);
+
+      const shortId = decodeURIComponent(url.pathname.replace('/api/admin/refresh/', '').trim());
+      const meta = await getMeta(env, shortId);
+      if (!meta || meta.type !== 'proxy') {
+        return jsonResponse({ error: 'Only proxy link can refresh' }, 400, corsHeaders);
+      }
+
+      const nowMs = Date.now();
+      const lastRefresh = meta.lastRefreshAt ? Date.parse(meta.lastRefreshAt) : 0;
+      if (lastRefresh && !Number.isNaN(lastRefresh) && (nowMs - lastRefresh < 30_000)) {
+        return jsonResponse({ error: 'refresh too frequent, wait 30s' }, 429, corsHeaders);
+      }
+
+      try {
+        await env.LINK_META.delete(`cache_${shortId}`);
+
+        const { response, usedUA, fetchedUrl } = await fetchOriginWithRotation(
+          meta.targetUrl,
+          getClientIp(request),
+          'GET',
+          PROXY_SERVER_URL
+        );
+
+        const subInfo = headerAny(response.headers, [
+          'subscription-userinfo',
+          'Subscription-Userinfo',
+          'x-subscription-userinfo',
+          'X-Subscription-Userinfo'
+        ]);
+        const pui = headerAny(response.headers, [
+          'profile-update-interval',
+          'Profile-Update-Interval',
+          'x-profile-update-interval',
+          'X-Profile-Update-Interval'
+        ]);
+
+        let finalBody;
+        let finalContentType = response.headers.get('content-type') || 'text/plain; charset=utf-8';
+        let finalContentDisposition = response.headers.get('content-disposition') || '';
+
+        if (meta.mode === 'yaml') {
+          const yamlResult = await fetchYamlFromSubscription(meta.targetUrl);
+          finalBody = yamlResult.body;
+          finalContentType = 'text/plain; charset=utf-8';
+          finalContentDisposition = '';
+        } else {
+          finalBody = await response.arrayBuffer();
+        }
+
+        const now = nowIso();
+
+        meta.snapshot = {
+          bodyBase64: encodeBase64FromArrayBuffer(finalBody),
+          contentType: finalContentType,
+          contentDisposition: finalContentDisposition,
+          subscriptionUserinfo: subInfo,
+          profileUpdateInterval: pui,
+          fetchedAt: now,
+          upstreamStatus: response.status,
+          usedUA,
+          fetchedUrl,
+        };
+        meta.lastStatus = response.status;
+        meta.updatedAt = now;
+        meta.cacheUpdatedAt = now;
+        meta.lastRefreshAt = now;
+        await saveMeta(env, shortId, meta);
+
+        await env.LINK_META.put(`cache_${shortId}`, JSON.stringify({
+          bodyBase64: encodeBase64FromArrayBuffer(finalBody),
+          contentType: finalContentType,
+          contentDisposition: finalContentDisposition,
+          subscriptionUserinfo: subInfo,
+          profileUpdateInterval: pui,
+          fetchedAt: now,
+        }));
+
+        return jsonResponse({ ok: true, shortId, cacheUpdatedAt: now }, 200, corsHeaders);
+      } catch (e) {
+        return jsonResponse({ error: `refresh failed: ${e.message}` }, 502, corsHeaders);
+      }
+    }
+
+    if (url.pathname.startsWith('/api/admin/update/') && request.method === 'PUT') {
+      if (!parseAuth(request, env)) return jsonResponse({ error: 'Unauthorized' }, 401, corsHeaders);
+
+      const shortId = decodeURIComponent(url.pathname.replace('/api/admin/update/', '').trim());
+      const newText = await request.text();
+      if (!shortId || !newText) return jsonResponse({ error: 'Invalid' }, 400, corsHeaders);
+
+      const meta = await getMeta(env, shortId);
+      if (meta?.type === 'proxy') return jsonResponse({ error: 'Proxy cannot update by text' }, 400, corsHeaders);
+
+      await env.TEXT_STORAGE.put(shortId, newText);
+
+      const metaNew = meta || { shortId, createdAt: nowIso() };
+      metaNew.type = 'text';
+      metaNew.shortId = shortId;
+      metaNew.updatedAt = nowIso();
+      metaNew.textLength = newText.length;
+      if (!metaNew.createdAt) metaNew.createdAt = nowIso();
+      await saveMeta(env, shortId, metaNew);
+
+      await env.LINK_META.delete(`cache_${shortId}`);
+      return jsonResponse({ ok: true, shortId }, 200, corsHeaders);
+    }
+
+    if (url.pathname.startsWith('/api/admin/customize/') && request.method === 'PUT') {
+      if (!parseAuth(request, env)) return jsonResponse({ error: 'Unauthorized' }, 401, corsHeaders);
+
+      const shortId = decodeURIComponent(url.pathname.replace('/api/admin/customize/', '').trim());
+      if (!shortId) return jsonResponse({ error: 'Invalid shortId' }, 400, corsHeaders);
+
+      const body = await request.json().catch(() => null);
+      if (!body || typeof body !== 'object') return jsonResponse({ error: 'Invalid JSON' }, 400, corsHeaders);
+
+      const meta = await getMeta(env, shortId);
+      if (!meta) {
+        const old = await env.TEXT_STORAGE.get(shortId);
+        if (old === null) return jsonResponse({ error: 'Not found' }, 404, corsHeaders);
+      }
+
+      const metaNew = meta || { shortId, createdAt: nowIso(), type: 'text' };
+
+      if (body.clear === true) {
+        delete metaNew.custom;
+      } else {
+        metaNew.custom = {
+          profileName: String(body.profileName || '').trim(),
+          subscriptionUserinfo: String(body.subscriptionUserinfo || '').trim(),
+        };
+      }
+
+      metaNew.updatedAt = nowIso();
+      await saveMeta(env, shortId, metaNew);
+
+      return jsonResponse({ ok: true, shortId }, 200, corsHeaders);
+    }
+
+    // 文本短链创建（/sc /clash）
+    if (
+      (url.pathname === '/api/store/permanent' ||
+        url.pathname === '/api/store/7d' ||
+        url.pathname === '/api/store') &&
+      request.method === 'POST'
+    ) {
+      const text = await request.text();
+      if (!text) return textResponse('Text content is required.', 400, corsHeaders);
+
+      const shortId = await generateUniqueShortId(env.TEXT_STORAGE);
+      await env.TEXT_STORAGE.put(shortId, text);
+
+      const profileName = getHeaderTrimmed(request, ['X-Profile-Name', 'x-profile-name']);
+      const subscriptionUserinfo = getHeaderTrimmed(request, ['X-Subscription-Userinfo', 'x-subscription-userinfo']);
+
+      const meta = {
+        type: 'text',
+        shortId,
+        createdAt: nowIso(),
+        updatedAt: nowIso(),
+        textLength: text.length,
+        ttlType: url.pathname === '/api/store/permanent'
+          ? 'permanent'
+          : (url.pathname === '/api/store/7d' ? '7d' : 'default'),
+      };
+
+      if (profileName || subscriptionUserinfo) {
+        meta.custom = {
+          profileName,
+          subscriptionUserinfo,
+        };
+      }
+
+      await saveMeta(env, shortId, meta);
+      return jsonResponse({ shortLink: `${url.origin}/${shortId}` }, 200, corsHeaders);
+    }
+
+    // proxy 短链创建（/dlzz）
+    if (url.pathname === '/api/proxy/create' && request.method === 'POST') {
+      const body = await request.json().catch(() => null);
+      const targetUrl = body?.targetUrl?.trim();
+      const profileName = String(body?.profileName || '').trim();
+      const mode = String(body?.mode || 'raw').trim().toLowerCase() === 'yaml' ? 'yaml' : 'raw';
+
+      if (!targetUrl) return jsonResponse({ error: 'targetUrl is required' }, 400, corsHeaders);
+
+      const shortId = await generateUniqueShortId(env.TEXT_STORAGE);
+      const now = nowIso();
+
+      const { response } = await fetchOriginWithRotation(targetUrl, getClientIp(request), 'GET', PROXY_SERVER_URL);
+
+      const originSubInfo = headerAny(response.headers, [
+        'subscription-userinfo',
+        'Subscription-Userinfo',
+        'x-subscription-userinfo',
+        'X-Subscription-Userinfo'
+      ]);
+
+      const originPui = headerAny(response.headers, [
+        'profile-update-interval',
+        'Profile-Update-Interval',
+        'x-profile-update-interval',
+        'X-Profile-Update-Interval'
+      ]);
+
+      let finalBody;
+      let finalContentType = response.headers.get('content-type') || 'text/plain; charset=utf-8';
+      let finalContentDisposition = response.headers.get('content-disposition') || '';
+
+      if (mode === 'yaml') {
+        const yamlResult = await fetchYamlFromSubscription(targetUrl);
+        finalBody = yamlResult.body;
+        finalContentType = 'text/plain; charset=utf-8';
+        finalContentDisposition = '';
+      } else {
+        finalBody = await response.arrayBuffer();
+      }
+
+      const meta = {
+        type: 'proxy',
+        mode,
+        shortId,
+        targetUrl,
+        createdAt: now,
+        updatedAt: now,
+        cacheUpdatedAt: now,
+        lastStatus: response.status,
+        custom: profileName ? { profileName, subscriptionUserinfo: '' } : undefined,
+        snapshot: {
+          subscriptionUserinfo: originSubInfo,
+          profileUpdateInterval: originPui
+        }
+      };
+
+      await saveMeta(env, shortId, meta);
+      await env.TEXT_STORAGE.put(shortId, PROXY_PLACEHOLDER);
+
+      await env.LINK_META.put(`cache_${shortId}`, JSON.stringify({
+        bodyBase64: encodeBase64FromArrayBuffer(finalBody),
+        contentType: finalContentType,
+        contentDisposition: finalContentDisposition,
+        subscriptionUserinfo: originSubInfo,
+        profileUpdateInterval: originPui,
+        fetchedAt: now,
+      }));
+
+      return jsonResponse({
+        shortLink: `${url.origin}/${shortId}`,
+        type: 'proxy',
+        mode,
+        profileName: profileName || ''
+      }, 200, corsHeaders);
+    }
+
+    // 访问短链
+    if (request.method === 'GET') {
+      const shortId = url.pathname.substring(1);
+      if (shortId && !shortId.includes('/')) {
+        const meta = await getMeta(env, shortId);
+
+        if (meta && meta.type === 'proxy') {
+          const cached = await env.LINK_META.get(`cache_${shortId}`, { type: 'json' });
+          if (!cached?.bodyBase64) return textResponse('Proxy cache missing. Refresh it.', 502, corsHeaders);
+
+          const body = decodeBase64ToUint8Array(cached.bodyBase64);
+          const fakeUpstream = new Headers();
+          if (cached.contentType) fakeUpstream.set('Content-Type', cached.contentType);
+          if (cached.contentDisposition) fakeUpstream.set('Content-Disposition', cached.contentDisposition);
+          if (cached.subscriptionUserinfo) fakeUpstream.set('subscription-userinfo', cached.subscriptionUserinfo);
+          if (cached.profileUpdateInterval) fakeUpstream.set('profile-update-interval', cached.profileUpdateInterval);
+
+          const proxyCustom = buildProxyCustomHeaders(meta);
+          const extra = { 'X-Shortlink-Type': 'proxy', ...corsHeaders };
+          for (const [k, v] of proxyCustom.entries()) extra[k] = v;
+
+          const headers = copyHeadersRaw(fakeUpstream, extra);
+          if (!headers.get('Content-Type')) headers.set('Content-Type', cached.contentType || 'text/plain; charset=utf-8');
+          if (cached.contentDisposition) headers.set('Content-Disposition', cached.contentDisposition);
+
+          return new Response(body, { status: 200, headers });
+        }
+
+        const text = await env.TEXT_STORAGE.get(shortId);
+        if (text && text !== PROXY_PLACEHOLDER) {
+          const headers = new Headers({ 'Content-Type': 'text/plain; charset=utf-8', ...corsHeaders });
+          const customHeaders = buildTextCustomHeaders(meta);
+          for (const [k, v] of customHeaders.entries()) headers.set(k, v);
+          return new Response(text, { status: 200, headers });
+        }
+
+        return textResponse('Not found.', 404, corsHeaders);
+      }
+    }
+
+    return textResponse('Welcome.', 200, corsHeaders);
+  },
 };
